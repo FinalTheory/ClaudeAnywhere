@@ -205,7 +205,22 @@ function applyResyncWindow(turns, startIndex) {
     startIndex === loadedStartIndex && turns.length === n && n === renderedTurns.length;
   if (sameWindow && turns.slice(0, -1).every((t, i) => t === renderedTurns[i])) {
     if (turns[n - 1] !== renderedTurns[n - 1]) {
-      transcriptEl.children[n - 1].outerHTML = turns[n - 1];
+      // The captured HTML carries none of the phone-local collapse
+      // markers, so replacing the turn wholesale drops them and the
+      // applyCollapse() below re-caps a prompt the reader just opened —
+      // once every poll, for as long as the reply streams. The user's own
+      // blocks do not change while the reply grows, so their positions
+      // within the turn line up before and after; carry the flag across
+      // by position.
+      const stale = transcriptEl.children[n - 1];
+      const wasExpanded = Array.from(stale.querySelectorAll('[aria-label="You"]')).map(
+        (u) => u.dataset.expanded === '1',
+      );
+      stale.outerHTML = turns[n - 1];
+      const fresh = transcriptEl.children[n - 1].querySelectorAll('[aria-label="You"]');
+      wasExpanded.forEach((was, i) => {
+        if (was && fresh[i]) fresh[i].dataset.expanded = '1';
+      });
       renderedTurns = turns.slice();
       applyCollapse();
     }
@@ -317,11 +332,21 @@ let loadingMore = false;
 transcriptEl.addEventListener('scroll', async () => {
   if (transcriptEl.scrollTop > 40 || !hasMore || !currentSessionId || loadingMore) return;
   loadingMore = true;
+  // What this page was asked for. A resync can land while the request is
+  // in flight and reset the whole window to a newer tail; applying the
+  // answer to that different window prepends turns that no longer meet
+  // the ones on screen, drops whatever sat between them, and then sets
+  // hasMore from a stale answer so the gap can never be paged back in.
+  const askedFrom = loadedStartIndex;
+  const askedFor = currentSessionId;
   try {
     const res = await fetch(
-      `/api/session/${currentSessionId}/history?before_index=${loadedStartIndex}&limit_bytes=2048`
+      `/api/session/${askedFor}/history?before_index=${askedFrom}&limit_bytes=2048`
     );
     const data = await res.json();
+    if (loadedStartIndex !== askedFrom || currentSessionId !== askedFor) {
+      return; // window moved under us — scrolling again asks from the new cursor
+    }
     if (!data.turns || data.turns.length === 0) {
       hasMore = false;
       return;
