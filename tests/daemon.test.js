@@ -616,3 +616,60 @@ test('_tick: the running probe going blind is reported, not ignored', async (t) 
     [true, null],
   );
 });
+
+// --- surviving VS Code going away ----------------------------------------
+// Quitting VS Code closes port 9222. The fetch refuses, and before this
+// the rejection escaped an async event listener and killed the process:
+// "TypeError: fetch failed ... ECONNREFUSED 127.0.0.1:9222".
+
+test('_listSessions: CDP being unreachable reports no sessions, not a throw', async (t) => {
+  t.mock.method(cdp, 'listClaudeSessions', async () => {
+    const err = new TypeError('fetch failed');
+    err.cause = { code: 'ECONNREFUSED', port: 9222 };
+    throw err;
+  });
+  const d = new Daemon();
+  assert.deepStrictEqual(await d._listSessions(), []);
+});
+
+test('_listSessions: recovers on the next call once VS Code is back', async (t) => {
+  // No state is kept about the outage, so "retry" is just the next call.
+  let up = false;
+  t.mock.method(cdp, 'listClaudeSessions', async () => {
+    if (!up) throw new TypeError('fetch failed');
+    return [{ sessionId: 'sid', targetId: 'T', url: 'x' }];
+  });
+  t.mock.method(cdp, 'readSessionNames', async () => ({}));
+  t.mock.method(cdp, 'findTarget', async () => ({ webSocketDebuggerUrl: 'ws://x' }));
+  t.mock.method(cdp, 'connect', async () => ({ ws: { close() {} }, send: async () => ({}) }));
+  t.mock.method(cdp, 'getFrames', async () => []);
+  t.mock.method(cdp, 'pickContentFrame', async () => null);
+
+  const d = new Daemon();
+  assert.deepStrictEqual(await d._listSessions(), []);
+  up = true;
+  const back = await d._listSessions();
+  assert.deepStrictEqual(back.map((s) => s.sessionId), ['sid']);
+});
+
+test('a rejecting message handler is caught instead of crashing the process', async (t) => {
+  const sockets = withFakeSockets(t);
+  const d = new Daemon();
+  d.connect();
+  // Reject from inside the handler rather than from a CDP call: every CDP
+  // entry point is individually guarded, so a test that leans on one of
+  // them passes whether or not this listener catches anything. The point
+  // here is the listener itself — any future rejection, from any branch.
+  d._listSessions = async () => {
+    throw new Error('boom');
+  };
+
+  const unhandled = [];
+  const onUnhandled = (e) => unhandled.push(e);
+  process.on('unhandledRejection', onUnhandled);
+  t.after(() => process.off('unhandledRejection', onUnhandled));
+
+  sockets[0].emit('message', { data: JSON.stringify({ type: 'list_sessions', reqId: 1 }) });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepStrictEqual(unhandled, [], 'nothing escapes the listener');
+});

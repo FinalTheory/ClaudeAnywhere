@@ -452,6 +452,15 @@ class SessionWatcher {
   }
 }
 
+// Best-effort label for a log line; the payload may not be JSON at all.
+function msgType(raw) {
+  try {
+    return JSON.parse(raw).type || 'message';
+  } catch (e) {
+    return 'message';
+  }
+}
+
 class Daemon {
   constructor() {
     this.ws = null;
@@ -473,7 +482,18 @@ class Daemon {
       this.reconnectDelay = 1000;
       this._send({ type: 'hello', token: AUTH_TOKEN });
     });
-    this.ws.addEventListener('message', (ev) => this._handleMessage(ev.data));
+    this.ws.addEventListener('message', (ev) => {
+      // _handleMessage is async and nothing awaits its promise. An
+      // unhandled rejection inside an EventTarget listener is rethrown on
+      // the next tick and takes the process down — which is how quitting
+      // VS Code killed the daemon: the CDP fetch refused with
+      // ECONNREFUSED 127.0.0.1:9222 and the rejection escaped. Nothing
+      // arriving here is worth dying for; the VPS link and the poll loops
+      // both recover on their own.
+      this._handleMessage(ev.data).catch((err) => {
+        console.error(`Error handling ${msgType(ev.data)}: ${err.message}`);
+      });
+    });
     this.ws.addEventListener('close', (ev) => {
       if (gen !== this.generation) return; // superseded; a reconnect is already in flight
       // code/reason are the actual diagnostic here — e.g. 1009 means a
@@ -594,7 +614,17 @@ class Daemon {
   }
 
   async _listSessions() {
-    const targets = await cdp.listClaudeSessions(CDP_PORT);
+    let targets;
+    try {
+      targets = await cdp.listClaudeSessions(CDP_PORT);
+    } catch (err) {
+      // VS Code is closed, restarting, or was started without
+      // --remote-debugging-port. An empty list is the honest answer —
+      // there are no open sessions — and the next /api/sessions call
+      // retries, so recovery needs no state here.
+      console.error(`CDP unreachable on port ${CDP_PORT} (${err.message}) — reporting no sessions`);
+      return [];
+    }
     // One read of the sidebar for the whole list, not one per session.
     const names = await cdp.readSessionNames(CDP_PORT);
     const claims = new Map();
