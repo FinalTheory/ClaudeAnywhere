@@ -111,6 +111,24 @@ have this session open" — the daemon only polls sessions someone is actually
 looking at. Nobody watching = zero daemon-side polling, zero traffic on the
 VPS link.
 
+## Tests
+
+```bash
+node --test "tests/*.test.js"      # daemon + cdp-client (no deps, no network)
+python3 tests/test_server.py       # server: pure logic, HTTP, and WS flows
+```
+
+`tests/` sits outside `server/` deliberately — the daemon's deploy-watch
+rsyncs `server/` to the VPS on every change, and a test file landing there
+would ship to production and restart it on every edit.
+
+Both suites run offline: the Node tests stub `fetch` and the CDP client
+seam (`daemon.js` holds `cdp` as a module object rather than destructuring
+it, so a test can substitute `cdp.evaluate`); the Python tests use
+aiohttp's test client with a fake daemon on the other end of `/ws/client`.
+Every test was checked against a mutation of the behaviour it names — see
+the commit that added them.
+
 ## Running it
 
 **VPS — must sit behind TLS.** `server.py` binds a raw HTTP/WS port with no

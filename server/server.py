@@ -200,14 +200,18 @@ async def _cleanup_loop(app: web.Application):
         await asyncio.sleep(3600)
 
 
+# A typed key rather than a bare string — aiohttp warns on the latter.
+CLEANUP_TASK = web.AppKey("cleanup_task", asyncio.Task)
+
+
 async def _start_background_tasks(app: web.Application):
-    app["cleanup_task"] = asyncio.create_task(_cleanup_loop(app))
+    app[CLEANUP_TASK] = asyncio.create_task(_cleanup_loop(app))
 
 
 async def _stop_background_tasks(app: web.Application):
-    app["cleanup_task"].cancel()
+    app[CLEANUP_TASK].cancel()
     try:
-        await app["cleanup_task"]
+        await app[CLEANUP_TASK]
     except asyncio.CancelledError:
         pass
 
@@ -388,9 +392,12 @@ async def login_page(request: web.Request) -> web.Response:
         form = await request.post()
         if hmac.compare_digest(str(form.get("password", "")), AUTH_TOKEN):
             expiry = int(time.time()) + COOKIE_MAX_AGE
-            resp = web.HTTPFound("/app")
+            # raise, not return: aiohttp deprecated returning an
+            # HTTPException (it warns now and is slated for removal), and
+            # the cookie rides along on the raised response either way.
+            resp = web.HTTPFound("/")
             resp.set_cookie(COOKIE_NAME, _sign(expiry), max_age=COOKIE_MAX_AGE, httponly=True, samesite="Strict")
-            return resp
+            raise resp
         return web.Response(text=template.replace("{{error}}", "Wrong password"), content_type="text/html")
     return web.Response(text=template.replace("{{error}}", ""), content_type="text/html")
 

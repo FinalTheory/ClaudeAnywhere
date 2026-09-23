@@ -28,12 +28,14 @@
 //                      without a terminal attached to wherever this process
 //                      actually runs.
 //
-// Wire protocol (JSON text frames), client -> VPS:
+// Wire protocol (JSON text frames), client -> VPS. `turns` is always an
+// array of complete per-message HTML fragments, never one flat string —
+// see the POLL_EXPR comment for why that distinction is load-bearing.
 //   {type:"hello", token}
-//   {type:"sessions_result", reqId, sessions:[{sessionId, preview, running}]}
+//   {type:"sessions_result", reqId, sessions:[{sessionId, title, preview, running}]}
 //   {type:"state", sessionId, running}
-//   {type:"append", sessionId, html}
-//   {type:"resync", sessionId, html}
+//   {type:"append", sessionId, turns}   // extend what the VPS has
+//   {type:"resync", sessionId, turns}   // capped tail; VPS splices by content overlap
 //   {type:"submit_ack", sessionId, ok, error?}
 //   {type:"error", sessionId, message}
 //
@@ -52,34 +54,34 @@ const fs = require('fs');
 // Patches console.error/console.log globally rather than threading a logger
 // through every call site; this file already treats console.error as its
 // only diagnostic channel throughout, so this is a one-line hook, not a
-// rewrite.
+// rewrite. Only installed when run as a program (see the bottom of this
+// file): importing this module for tests must not create a log file.
 const LOG_FILE = path.resolve(__dirname, process.env.LOG_FILE || 'daemon.log');
-for (const method of ['error', 'log']) {
-  const original = console[method].bind(console);
-  console[method] = (...args) => {
-    original(...args);
-    const line = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
-    // Synchronous append, not a buffered WriteStream: this checkout is a
-    // bind mount into a devcontainer, and a stream's internal buffering
-    // combined with mount-layer caching meant log lines weren't visible on
-    // the other side until well after they were "written". appendFileSync
-    // forces the write syscall to actually complete before returning.
-    try {
-      fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${line}\n`);
-    } catch (e) {
-      // never let logging itself take the process down
-    }
-  };
+function installFileLogging() {
+  for (const method of ['error', 'log']) {
+    const original = console[method].bind(console);
+    console[method] = (...args) => {
+      original(...args);
+      const line = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+      // Synchronous append, not a buffered WriteStream: this checkout is a
+      // bind mount into a devcontainer, and a stream's internal buffering
+      // combined with mount-layer caching meant log lines weren't visible on
+      // the other side until well after they were "written". appendFileSync
+      // forces the write syscall to actually complete before returning.
+      try {
+        fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${line}\n`);
+      } catch (e) {
+        // never let logging itself take the process down
+      }
+    };
+  }
 }
 
-const {
-  findTarget,
-  connect,
-  getFrames,
-  pickContentFrame,
-  evaluate,
-  listClaudeSessions,
-} = require('../cdp-client');
+// Held as a module object, not destructured: call sites go through `cdp.x`
+// so a test can substitute one of these without the binding having been
+// captured at require time. That seam is the only way submit()/attach()
+// are reachable without a live Chrome.
+const cdp = require('../cdp-client');
 
 const CDP_PORT = Number(process.env.CDP_PORT || 9222);
 const VPS_WS_URL = process.env.VPS_WS_URL;
@@ -90,9 +92,11 @@ const DEPLOY_TARGET = process.env.DEPLOY_TARGET;
 const DEPLOY_WATCH_DIR = path.resolve(__dirname, process.env.DEPLOY_WATCH_DIR || '../server');
 const DEPLOY_DEBOUNCE_MS = 400; // never needed tuning in practice
 
-if (!VPS_WS_URL || !AUTH_TOKEN) {
-  console.error('Set VPS_WS_URL and AUTH_TOKEN env vars.');
-  process.exit(1);
+function requireEnv() {
+  if (!VPS_WS_URL || !AUTH_TOKEN) {
+    console.error('Set VPS_WS_URL and AUTH_TOKEN env vars.');
+    process.exit(1);
+  }
 }
 
 // One combined probe per poll tick. The send button's aria-label flip
@@ -170,6 +174,32 @@ function arraysEqual(a, b) {
   return true;
 }
 
+// The whole client-side wire decision, as a pure function of (what we last
+// reported, what we see now, whether this is the first read after a fresh
+// subscribe). Extracted from _tick so it can be tested without CDP: this is
+// the logic that, when it was wrong, silently duplicated a whole
+// conversation into the server's one persisted copy on every restart.
+//
+// Returns { kind: 'none' | 'append' | 'resync', turns } where `turns` is
+// exactly what goes on the wire — a suffix for append, a capped tail for
+// resync (the server reconciles that tail by content overlap, so it doesn't
+// need the daemon's full history, just enough to find the splice point).
+function diffTurns(lastTurns, turns, forceResync) {
+  if (forceResync) {
+    return { kind: 'resync', turns: turns.slice(-MAX_RESYNC_TURNS) };
+  }
+  if (arraysEqual(turns, lastTurns)) {
+    return { kind: 'none', turns: [] };
+  }
+  if (arraysEqual(turns.slice(0, lastTurns.length), lastTurns)) {
+    return { kind: 'append', turns: turns.slice(lastTurns.length) };
+  }
+  // Turn count went backward, or an earlier turn's content changed (VS Code
+  // virtualized something out, or genuinely edited history) — not
+  // expressible as a clean append, fall back to resync.
+  return { kind: 'resync', turns: turns.slice(-MAX_RESYNC_TURNS) };
+}
+
 // Cmd+Enter submits in this UI (confirmed empirically — plain Enter does
 // not). modifiers bitmask: Alt=1, Ctrl=2, Meta/Cmd=4, Shift=8.
 const CMD_MODIFIER = 4;
@@ -221,10 +251,10 @@ class SessionWatcher {
   }
 
   async attach() {
-    const target = await findTarget(CDP_PORT, this.sessionId);
-    this.client = await connect(target);
-    const frames = await getFrames(this.client);
-    const picked = await pickContentFrame(this.client, frames);
+    const target = await cdp.findTarget(CDP_PORT, this.sessionId);
+    this.client = await cdp.connect(target);
+    const frames = await cdp.getFrames(this.client);
+    const picked = await cdp.pickContentFrame(this.client, frames);
     if (!picked) throw new Error('no content frame found (see scan-frames.js)');
     this.picked = picked;
   }
@@ -242,35 +272,18 @@ class SessionWatcher {
   async _tick() {
     if (this.closed) return;
     try {
-      const result = await evaluate(this.client, POLL_EXPR, this.picked.contextId);
+      const result = await cdp.evaluate(this.client, POLL_EXPR, this.picked.contextId);
       if (result.title) this.lastTitle = result.title;
       if (result.running !== null && result.running !== this.lastRunning) {
         this.lastRunning = result.running;
         this.onEvent({ type: 'state', sessionId: this.sessionId, running: result.running });
       }
       const turns = result.turns;
-      if (this.forceResyncNext) {
-        // Capped, not the full history — the server reconciles this against
-        // whatever it already has via content-overlap matching (see
-        // SessionState.apply_resync), so it doesn't need everything the
-        // daemon can see, just enough tail to find where it overlaps.
-        this.onEvent({ type: 'resync', sessionId: this.sessionId, turns: turns.slice(-MAX_RESYNC_TURNS) });
+      const diff = diffTurns(this.lastTurns, turns, this.forceResyncNext);
+      if (diff.kind !== 'none') {
+        this.onEvent({ type: diff.kind, sessionId: this.sessionId, turns: diff.turns });
         this.lastTurns = turns;
         this.forceResyncNext = false;
-      } else if (!arraysEqual(turns, this.lastTurns)) {
-        if (arraysEqual(turns.slice(0, this.lastTurns.length), this.lastTurns)) {
-          this.onEvent({
-            type: 'append',
-            sessionId: this.sessionId,
-            turns: turns.slice(this.lastTurns.length),
-          });
-        } else {
-          // Turn count went backward, or an earlier turn's content changed
-          // (VS Code virtualized something out, or genuinely edited history)
-          // — not expressible as a clean append, fall back to resync.
-          this.onEvent({ type: 'resync', sessionId: this.sessionId, turns: turns.slice(-MAX_RESYNC_TURNS) });
-        }
-        this.lastTurns = turns;
       }
     } catch (err) {
       console.error(`[${this.sessionId}] poll error: ${err.message} — reattaching`);
@@ -300,7 +313,7 @@ class SessionWatcher {
     // then Cmd+Enter at the end to submit.
     const lines = text.split('\n');
     for (let i = 0; i < lines.length; i++) {
-      const result = await evaluate(this.client, injectExpr(lines[i]), this.picked.contextId);
+      const result = await cdp.evaluate(this.client, injectExpr(lines[i]), this.picked.contextId);
       if (!result.ok) return result;
       if (i < lines.length - 1) {
         await dispatchEnter(this.client, 0);
@@ -439,7 +452,7 @@ class Daemon {
   }
 
   async _listSessions() {
-    const targets = await listClaudeSessions(CDP_PORT);
+    const targets = await cdp.listClaudeSessions(CDP_PORT);
     const sessions = [];
     for (const t of targets) {
       const existing = this.watchers.get(t.sessionId);
@@ -457,15 +470,15 @@ class Daemon {
       // simultaneous attach), hence the separate connect here.
       let client;
       try {
-        const target = await findTarget(CDP_PORT, t.sessionId);
-        client = await connect(target);
-        const frames = await getFrames(client);
-        const picked = await pickContentFrame(client, frames);
+        const target = await cdp.findTarget(CDP_PORT, t.sessionId);
+        client = await cdp.connect(target);
+        const frames = await cdp.getFrames(client);
+        const picked = await cdp.pickContentFrame(client, frames);
         let preview = '';
         let running = null;
         let title = null;
         if (picked) {
-          const result = await evaluate(client, POLL_EXPR, picked.contextId);
+          const result = await cdp.evaluate(client, POLL_EXPR, picked.contextId);
           preview = stripTags(result.turns.join('')).slice(-150);
           running = result.running;
           title = result.title;
@@ -526,5 +539,27 @@ function startDeployWatch() {
   });
 }
 
-new Daemon().connect();
-if (DEPLOY_TARGET) startDeployWatch();
+// Run as a program: install file logging, check env, connect, optionally
+// deploy-watch. Imported as a module (tests): none of that happens, and the
+// pure pieces below are what's exercised. Keeping the startup behind this
+// guard is the only reason this file is testable at all — before it, a bare
+// `require()` would exit the process on a missing env var.
+if (require.main === module) {
+  installFileLogging();
+  requireEnv();
+  new Daemon().connect();
+  if (DEPLOY_TARGET) startDeployWatch();
+}
+
+module.exports = {
+  diffTurns,
+  arraysEqual,
+  stripTags,
+  injectExpr,
+  dispatchEnter,
+  SessionWatcher,
+  Daemon,
+  POLL_EXPR,
+  MAX_RESYNC_TURNS,
+  CMD_MODIFIER,
+};
