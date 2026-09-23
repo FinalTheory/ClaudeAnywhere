@@ -146,9 +146,17 @@ class SessionState:
         # best; ties go to the latest position, which is what keeps a
         # streaming edit of the final turn (same first turn, one turn
         # changed) splicing in place rather than re-appending.
+        # A tail of N turns can account for at most N stored turns, so any
+        # position earlier than len(turns) - N would splice away stored
+        # turns the incoming tail never claimed to describe — deleting a
+        # visible block from the phone. That bound is also what stops a
+        # repeated pattern from scoring a false overlap far back in
+        # history: [A,B,A,B,C] resynced with [B,A] matches at index 1 for
+        # two turns and at index 3 for one, and index 1 is the wrong answer.
         overlap_at = None
         best_run = 0
-        for i in range(len(self.turns)):
+        earliest = len(self.turns) - len(incoming)
+        for i in range(max(0, earliest), len(self.turns)):
             if self.turns[i] != incoming[0]:
                 continue
             run = 0

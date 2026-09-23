@@ -123,7 +123,9 @@ test('_tick: the second read is an append of only what is new', async (t) => {
   await w._tick();
   const content = events.filter((e) => e.type !== 'state');
   assert.deepStrictEqual(content.map((e) => e.type), ['resync', 'append']);
-  assert.deepStrictEqual(content[1].turns, ['b'], 'only the new turn goes on the wire');
+  // Full event shape, not just the turns: an event missing sessionId is
+  // unroutable at the server and the phone silently goes stale.
+  assert.deepStrictEqual(content[1], { type: 'append', sessionId: 'sid', turns: ['b'] });
 });
 
 test('_tick: an unchanged read emits nothing at all', async (t) => {
@@ -148,8 +150,11 @@ test('_tick: a running-state flip is reported once, not on every poll', async (t
   await w._tick();
   await w._tick();
   assert.deepStrictEqual(
-    events.filter((e) => e.type === 'state').map((e) => e.running),
-    [false, true],
+    events.filter((e) => e.type === 'state'),
+    [
+      { type: 'state', sessionId: 'sid', running: false },
+      { type: 'state', sessionId: 'sid', running: true },
+    ],
   );
 });
 

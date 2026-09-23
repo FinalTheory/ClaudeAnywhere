@@ -165,6 +165,36 @@ class SessionStateTests(IsolatedState):
         st.apply_resync(["A", "B", "A", "C"])
         self.assertEqual(st.turns, ["A", "B", "A", "C"])
 
+    def test_a_short_resync_never_splices_away_stored_turns(self):
+        # A tail of N turns can only account for N stored turns. Scoring a
+        # match further back than that deletes a block the phone was
+        # showing: [A,B,A,B,C] with the DOM virtualized down to [B,A]
+        # matches at index 1 for two turns and at index 3 for one, and
+        # taking index 1 drops the last two turns entirely.
+        st = self.make(["A", "B", "A", "B", "C"])
+        st.apply_resync(["B", "A"])
+        self.assertEqual(st.turns, ["A", "B", "A", "B", "A"])
+
+    def test_resync_never_shortens_stored_history(self):
+        # The invariant behind the bound above, over the alphabet that
+        # maximises identical turns.
+        import itertools
+
+        for sl in range(6):
+            for il in range(1, 5):
+                for stored in itertools.product("AB", repeat=sl):
+                    for incoming in itertools.product("AB", repeat=il):
+                        st = self.make(list(stored))
+                        st.apply_resync(list(incoming))
+                        self.assertGreaterEqual(
+                            len(st.turns), len(stored),
+                            f"{stored} + {incoming} lost a visible block -> {st.turns}",
+                        )
+                        self.assertEqual(
+                            st.turns[-il:], list(incoming),
+                            f"{stored} + {incoming} -> {st.turns} does not end at what was sent",
+                        )
+
     def test_state_and_load_round_trip(self):
         st = self.make(["a"])
         st.apply_state(True)
