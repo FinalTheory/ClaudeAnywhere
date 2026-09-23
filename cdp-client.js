@@ -85,8 +85,15 @@ async function isolatedWorldContext(client, frameId) {
 
 const CONTENT_PROBE_EXPR = `
 (function() {
-  if (!document.body) return { innerTextLen: -1 };
-  return { innerTextLen: document.body.innerText.length };
+  if (!document.body) return { innerTextLen: -1, chatLike: 0 };
+  return {
+    innerTextLen: document.body.innerText.length,
+    // Semantic markers, not CSS-module names: a frame with transcript
+    // messages or a composer is the chat, whatever it is styled as.
+    chatLike:
+      document.querySelectorAll('[data-transcript-message]').length +
+      document.querySelectorAll('[role="textbox"], [contenteditable="true"]').length
+  };
 })()
 `;
 
@@ -100,8 +107,20 @@ async function pickContentFrame(client, frames) {
     try {
       contextId = await isolatedWorldContext(client, frame.id);
       const info = await evaluate(client, CONTENT_PROBE_EXPR, contextId);
-      if (info.innerTextLen > 0 && (!best || info.innerTextLen > best.innerTextLen)) {
-        best = { frame, contextId, innerTextLen: info.innerTextLen };
+      if (info.innerTextLen <= 0) continue;
+      // Most visible text is a decent heuristic and was enough in
+      // practice, but on its own it picks any text-heavy frame an upgrade
+      // introduces — a release note, a sign-in overlay, a bootstrap shell
+      // — and the daemon then polls valid JavaScript against the wrong
+      // document, reporting no turns rather than an error. A frame that
+      // actually contains the transcript always outranks one that merely
+      // has more words in it.
+      const better =
+        !best ||
+        (info.chatLike > 0 && best.chatLike === 0) ||
+        (info.chatLike > 0 === best.chatLike > 0 && info.innerTextLen > best.innerTextLen);
+      if (better) {
+        best = { frame, contextId, innerTextLen: info.innerTextLen, chatLike: info.chatLike };
       }
     } catch (err) {
       // skip — frame not evaluable, not necessarily an error worth surfacing

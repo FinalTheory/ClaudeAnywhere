@@ -55,11 +55,43 @@ Three places have earned scrutiny, because each has produced a visible defect:
    fresh watcher must report its first read as a `resync`, never an `append`.
    `[]` is a prefix of anything, so without the flag a restart appends a full
    snapshot onto history the server already has.
-3. **The phone's resync render path** (`server/static/app.js`) — while a
+3. **What a streaming reply costs the phone.** A turn is a whole exchange:
+   measured against a live session one was 98KB and the largest 284KB. At
+   the 1.5s poll rate an uncoalesced resync is ~240MB/hour to the phone and
+   was ~1.9GB/hour on the laptop uplink, because the tail carried every
+   turn to describe growth in one. Two rules keep that down and both are
+   load-bearing: `diffTurns` sends only the final turn when only the final
+   turn changed, and `shouldEmitNow` coalesces resyncs to
+   `RESYNC_MIN_INTERVAL_MS` while flushing at once on the first read of a
+   subscription and when a reply finishes. Appends are never delayed.
+4. **The phone's resync render path** (`server/static/app.js`) — while a
    response streams, the daemon resyncs on *every* poll, because the final
    turn's HTML grows in place. Rebuilding `#transcript` from `innerHTML` on each
    of those makes the composer unusable (a DOM teardown drops the iOS text
    selection). Patch the changed turn; do not rebuild.
+
+## Scraping someone else's DOM
+
+Everything here reads a closed-source extension's markup, so the question
+for any selector is not whether it will break but **whether anyone will
+notice when it does**. Silent failure is the one to design against.
+
+- Prefer semantic markup to CSS-module names. `aria-label`, `role` and
+  `data-*` are contracts the extension keeps for accessibility or for its
+  own code; `turn_07S1Yg` is a build artifact whose hash and prefix can
+  both move. Where an element carries both, use the semantic one — the
+  collapse unit is `[aria-label="You"]`, the session title comes from
+  `data-initial-session`, and the frame picker prefers a frame containing
+  `[data-transcript-message]` over merely the wordiest one.
+- `[class*="turn_"]` has no semantic alternative and is load-bearing, so
+  it gets a tell instead: finding message blocks but no turns reports a
+  DOM mismatch once per watcher rather than an empty conversation.
+- A probe that stops matching should report, not return a plausible
+  nothing. `running: null` is forwarded so the phone shows Unknown;
+  `execCommand` returning false fails the submit instead of acking it.
+- Cosmetic selectors — hidden copy buttons, Monaco chrome, line-height
+  overrides — need no defending. They fail visibly and are cheap to
+  re-derive from a fresh capture.
 
 ## Layout
 

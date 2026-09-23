@@ -9,6 +9,8 @@ const assert = require('node:assert');
 
 const cdp = require('../cdp-client.js');
 const {
+  shouldEmitNow,
+  RESYNC_MIN_INTERVAL_MS,
   resolveTitles,
   watchForWake,
   WAKE_PROBE_MS,
@@ -56,13 +58,23 @@ test('diffTurns: a pure suffix growth is an append of only the new turns', () =>
   assert.deepStrictEqual(out.turns, ['c']);
 });
 
-test('diffTurns: a changed last turn is a resync, never an append', () => {
+test('diffTurns: a changed last turn is a resync carrying only that turn', () => {
   // The streaming case: the final turn grows in place as tokens arrive.
-  // Appending here would leave the half-written turn sitting next to the
-  // finished one on the server.
+  // Appending would leave the half-written turn next to the finished one
+  // on the server; sending the whole tail would retransmit the entire
+  // conversation once every poll to describe growth in one turn.
   const out = diffTurns(['a', 'b-partial'], ['a', 'b-complete'], false);
   assert.strictEqual(out.kind, 'resync');
-  assert.deepStrictEqual(out.turns, ['a', 'b-complete']);
+  assert.deepStrictEqual(out.turns, ['b-complete'], 'only the turn that changed');
+});
+
+test('diffTurns: two turns changing at once still sends the generic tail', () => {
+  // The narrow streaming shortcut must not swallow this: a one-turn tail
+  // could not describe both changes, and a two-turn tail whose first entry
+  // coincidentally matched an older turn could splice late.
+  const out = diffTurns(['a', 'b', 'c'], ['a', 'B', 'C'], false);
+  assert.strictEqual(out.kind, 'resync');
+  assert.deepStrictEqual(out.turns, ['a', 'B', 'C']);
 });
 
 test('diffTurns: a shrinking turn list is a resync', () => {
@@ -510,4 +522,97 @@ test('resolveTitles: a contested uuid names neither webview', () => {
 test('resolveTitles: no sidebar at all is empty titles, not a throw', () => {
   const titles = resolveTitles(new Map([['wv-1', 'uuid-a']]), {});
   assert.strictEqual(titles.get('wv-1'), null);
+});
+
+// --- coalescing: what the phone actually pays -----------------------------
+// A turn measured 98KB against a real session and the largest was 284KB.
+// At the 1.5s poll rate a resync per tick is ~240MB/hour to the phone,
+// which is a held-up radio and a warm battery to deliver sub-second
+// latency on a reply nobody reads that fast.
+
+test('shouldEmitNow: an append always goes out at once', () => {
+  assert.ok(shouldEmitNow('append', { forced: false, becameIdle: false, msSinceResync: 0 }));
+});
+
+test('shouldEmitNow: nothing to send is never sent', () => {
+  assert.ok(!shouldEmitNow('none', { forced: true, becameIdle: true, msSinceResync: 1e9 }));
+});
+
+test('shouldEmitNow: a resync inside the interval is held back', () => {
+  assert.ok(!shouldEmitNow('resync', { forced: false, becameIdle: false, msSinceResync: 100 }));
+});
+
+test('shouldEmitNow: a resync past the interval goes', () => {
+  assert.ok(
+    shouldEmitNow('resync', {
+      forced: false,
+      becameIdle: false,
+      msSinceResync: RESYNC_MIN_INTERVAL_MS,
+    }),
+  );
+});
+
+test('shouldEmitNow: the first read of a subscription is never held back', () => {
+  // The server needs it to reconcile; delaying it leaves the phone on
+  // stale stored content for the whole interval.
+  assert.ok(shouldEmitNow('resync', { forced: true, becameIdle: false, msSinceResync: 0 }));
+});
+
+test('shouldEmitNow: the reply finishing flushes immediately', () => {
+  // Otherwise a session that has gone quiet sits missing its last tokens
+  // for seconds, with nothing due to arrive and prompt another poll.
+  assert.ok(shouldEmitNow('resync', { forced: false, becameIdle: true, msSinceResync: 0 }));
+});
+
+test('_tick: streaming ticks are coalesced, and finishing flushes at once', async (t) => {
+  const { w, events } = tickableWatcher(t, [
+    snap(['a-1'], true), // first read: forced resync
+    snap(['a-2'], true), // still streaming, inside the interval -> held
+    snap(['a-3'], true), // held
+    snap(['a-4'], false), // reply finished -> flush
+  ]);
+  await w._tick();
+  await w._tick();
+  await w._tick();
+  await w._tick();
+  const content = events.filter((e) => e.type !== 'state');
+  assert.deepStrictEqual(
+    content.map((e) => e.turns[0]),
+    ['a-1', 'a-4'],
+    'two sends, not four, and the last one carries the finished reply',
+  );
+});
+
+test('_tick: a new turn is never delayed by coalescing', async (t) => {
+  const { w, events } = tickableWatcher(t, [
+    snap(['a'], true),
+    snap(['a', 'b'], true), // an append lands immediately despite the interval
+  ]);
+  await w._tick();
+  await w._tick();
+  const content = events.filter((e) => e.type !== 'state');
+  assert.deepStrictEqual(content.map((e) => e.type), ['resync', 'append']);
+  assert.deepStrictEqual(content[1].turns, ['b']);
+});
+
+test('_tick: a held-back resync leaves the baseline alone so nothing is lost', async (t) => {
+  // lastTurns must not advance on a tick that sent nothing, or the next
+  // send would describe a delta against content the server never saw.
+  const { w } = tickableWatcher(t, [snap(['a-1'], true), snap(['a-2'], true)]);
+  await w._tick();
+  await w._tick();
+  assert.deepStrictEqual(w.lastTurns, ['a-1'], 'baseline still what was actually sent');
+});
+
+test('_tick: the running probe going blind is reported, not ignored', async (t) => {
+  // running:null means the send-button labels stopped matching. Ignoring
+  // it leaves the phone showing Running or Idle forever with no hint the
+  // probe broke; the phone renders null as Unknown.
+  const { w, events } = tickableWatcher(t, [snap(['a'], true), { running: null, turns: ['a'], title: null }]);
+  await w._tick();
+  await w._tick();
+  assert.deepStrictEqual(
+    events.filter((e) => e.type === 'state').map((e) => e.running),
+    [true, null],
+  );
 });

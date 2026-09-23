@@ -131,6 +131,15 @@ const POLL_EXPR = `
 (function() {
   const btn = document.querySelector('button[aria-label="Send message"], button[aria-label="Stop"]');
   const turns = Array.from(document.querySelectorAll('[class*="turn_"]')).map((el) => el.outerHTML);
+  // turn_ is a CSS-module name: a semantic prefix plus a build hash. If a
+  // Claude Code upgrade renames the prefix this selector quietly returns
+  // nothing, which is indistinguishable from an empty conversation — a new
+  // session looks blank and an existing one freezes on stored content,
+  // with no error anywhere. The message blocks inside a turn carry
+  // data-transcript-message, which is markup rather than a build artifact,
+  // so "messages exist but no turns" is a reliable tell that the turn
+  // selector, not the conversation, is what went missing.
+  const messageCount = document.querySelectorAll('[data-transcript-message]').length;
   return {
     running: btn ? btn.getAttribute('aria-label') === 'Stop' : null,
     turns,
@@ -138,6 +147,7 @@ const POLL_EXPR = `
     // extension's webviews — kept in case a future build changes that, but
     // don't rely on it; see inspect-tabs.js for the fallback approach.
     title: document.title || null,
+    domMismatch: turns.length === 0 && messageCount > 0 ? messageCount : 0,
     // Claude's own session uuid for this conversation, the join to the
     // names in the sidebar (see readSessionNames in cdp-client.js).
     // Absent on some webviews — one of four lacked it when this was
@@ -157,7 +167,14 @@ function injectExpr(text) {
   if (candidates.length === 0) return { ok: false, reason: 'no input candidates found' };
   const el = candidates[candidates.length - 1];
   el.focus();
-  document.execCommand('insertText', false, text);
+  // execCommand returns false when the command is unsupported or refused.
+  // Discarding that made submit() answer ok for text that never landed,
+  // so the phone cleared the composer and reported success. It is
+  // deprecated, and CDP's Input.insertText is the durable replacement —
+  // untried here because it cannot be verified without a live target.
+  if (!document.execCommand('insertText', false, text)) {
+    return { ok: false, reason: 'execCommand(insertText) was refused by the editor' };
+  }
   return { ok: true };
 })(${JSON.stringify(text)})
 `;
@@ -173,6 +190,33 @@ function stripTags(html) {
 // conversation. 50 is a generous margin over how many turns typically
 // change/appear between poll ticks.
 const MAX_RESYNC_TURNS = 50;
+
+// Content updates are coalesced to at most one per this interval while a
+// reply streams. Polling stays at POLL_INTERVAL_MS because the running/idle
+// probe is cheap and should stay responsive; it is the turn HTML that is
+// expensive to ship.
+//
+// Measured against a real session: a turn is 98KB and the largest is 284KB,
+// so a poll-rate resync is ~240MB/hour to the phone. That is a phone on
+// cellular holding its radio up continuously, and it buys sub-second
+// latency on a reply nobody reads that fast.
+//
+// An append is never delayed — a new turn is the visible event, and it
+// carries only the new turns rather than a snapshot.
+const RESYNC_MIN_INTERVAL_MS = Number(process.env.RESYNC_MIN_INTERVAL_MS || 5000);
+
+// Whether this poll's diff goes on the wire now or waits for the next one.
+// Extracted for the same reason diffTurns was: it is the part with a
+// judgment in it, and it decides how much a phone spends.
+function shouldEmitNow(kind, { forced, becameIdle, msSinceResync }) {
+  if (kind === 'none') return false;
+  if (kind === 'append') return true;
+  // A resync. Send at once when it is the first read of a subscription
+  // (the server needs it to reconcile), or when the reply just finished —
+  // waiting there would leave the last few tokens missing for seconds on
+  // a session that has gone quiet.
+  return forced || becameIdle || msSinceResync >= RESYNC_MIN_INTERVAL_MS;
+}
 
 function arraysEqual(a, b) {
   if (a.length !== b.length) return false;
@@ -201,6 +245,26 @@ function diffTurns(lastTurns, turns, forceResync) {
   }
   if (arraysEqual(turns.slice(0, lastTurns.length), lastTurns)) {
     return { kind: 'append', turns: turns.slice(lastTurns.length) };
+  }
+  // Streaming: same turn count, only the final turn's HTML differs as
+  // tokens arrive. The generic tail below would resend up to
+  // MAX_RESYNC_TURNS turns to describe a change confined to one — measured
+  // at 769KB per tick against a real session, every 1.5s, which is 1.9GB
+  // an hour of a laptop uplink to say that one reply grew.
+  //
+  // One turn is enough for the server to place it: apply_resync scans no
+  // earlier than len(stored) - len(incoming), so a one-turn tail can only
+  // land on the last stored turn. Restricted to "exactly the last turn
+  // differs" rather than "trim any common prefix" because a shorter tail
+  // whose first turn coincidentally equals some older stored turn could
+  // splice late and duplicate; with one turn the scan range is a single
+  // slot and that cannot happen.
+  if (
+    turns.length === lastTurns.length &&
+    turns.length > 0 &&
+    arraysEqual(turns.slice(0, -1), lastTurns.slice(0, -1))
+  ) {
+    return { kind: 'resync', turns: turns.slice(-1) };
   }
   // Turn count went backward, or an earlier turn's content changed (VS Code
   // virtualized something out, or genuinely edited history) — not
@@ -267,6 +331,8 @@ class SessionWatcher {
     this.lastRunning = null;
     this.lastTitle = null;
     this.lastSessionUuid = null;
+    this.lastResyncAt = 0;
+    this.reportedMismatch = false;
     this.timer = null;
     this.closed = false;
     // Every fresh subscribe (including after a daemon process restart, which
@@ -308,14 +374,32 @@ class SessionWatcher {
       const result = await cdp.evaluate(this.client, POLL_EXPR, this.picked.contextId);
       if (result.title) this.lastTitle = result.title;
       if (result.sessionUuid) this.lastSessionUuid = result.sessionUuid;
-      if (result.running !== null && result.running !== this.lastRunning) {
+      if (result.domMismatch && !this.reportedMismatch) {
+        // Once per watcher, not per poll: this fires every 1.5s otherwise.
+        this.reportedMismatch = true;
+        const msg =
+          `transcript selector matched nothing but found ${result.domMismatch} message ` +
+          'blocks — Claude Code\'s markup likely changed, see POLL_EXPR in daemon.js';
+        console.error(`[${this.sessionId}] ${msg}`);
+        this.onEvent({ type: 'error', sessionId: this.sessionId, message: msg });
+      }
+      const becameIdle = result.running === false && this.lastRunning !== false;
+      if (result.running !== this.lastRunning) {
         this.lastRunning = result.running;
         this.onEvent({ type: 'state', sessionId: this.sessionId, running: result.running });
       }
       const turns = result.turns;
       const diff = diffTurns(this.lastTurns, turns, this.forceResyncNext);
-      if (diff.kind !== 'none') {
+      const emit = shouldEmitNow(diff.kind, {
+        forced: this.forceResyncNext,
+        becameIdle,
+        msSinceResync: Date.now() - this.lastResyncAt,
+      });
+      if (emit) {
         this.onEvent({ type: diff.kind, sessionId: this.sessionId, turns: diff.turns });
+        // Only a resync resets the clock. Appends are cheap and must not
+        // buy a held-back snapshot extra time.
+        if (diff.kind === 'resync') this.lastResyncAt = Date.now();
         this.lastTurns = turns;
         this.forceResyncNext = false;
       }
@@ -657,6 +741,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  shouldEmitNow,
+  RESYNC_MIN_INTERVAL_MS,
   resolveTitles,
   watchForWake,
   WAKE_PROBE_MS,

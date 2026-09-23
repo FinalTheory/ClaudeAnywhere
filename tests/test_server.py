@@ -534,3 +534,33 @@ class WsFlowTests(AioHTTPTestCase, IsolatedState):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MinimalStreamingTailTests(IsolatedState):
+    """The daemon sends only the changed final turn while a reply streams.
+    The server has to place a one-turn tail correctly with no content
+    overlap to guide it — the length bound is what makes that work."""
+
+    def make(self, turns):
+        st = server.SessionState("s1")
+        st.turns = list(turns)
+        return st
+
+    def test_a_one_turn_tail_replaces_only_the_last_turn(self):
+        st = self.make(["A", "B", "C-partial"])
+        st.apply_resync(["C-complete"])
+        self.assertEqual(st.turns, ["A", "B", "C-complete"])
+
+    def test_repeated_one_turn_tails_do_not_accumulate(self):
+        st = self.make(["A", "B"])
+        for snapshot in ["c1", "c2", "c3"]:
+            st.apply_resync([snapshot])
+        self.assertEqual(st.turns, ["A", "c3"], "each tick replaces, never appends")
+
+    def test_a_one_turn_tail_matching_an_older_turn_still_lands_last(self):
+        # The reason the daemon restricts the shortcut to one turn: the
+        # scan range is a single slot, so an accidental match further back
+        # cannot be chosen.
+        st = self.make(["dup", "x", "y"])
+        st.apply_resync(["dup"])
+        self.assertEqual(st.turns, ["dup", "x", "dup"])

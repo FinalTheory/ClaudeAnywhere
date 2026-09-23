@@ -219,13 +219,24 @@ function applyResyncWindow(turns, startIndex) {
       // within the turn line up before and after; carry the flag across
       // by position.
       const stale = transcriptEl.children[n - 1];
-      const wasExpanded = Array.from(stale.querySelectorAll('[aria-label="You"]')).map(
-        (u) => u.dataset.expanded === '1',
-      );
+      // Carry every collapse marker, not just the expanded one. `fits` and
+      // the capped class are what make applyCollapse skip an element it
+      // has already measured; dropping them means the surviving prompt is
+      // measured again on each streaming tick, and each measurement reads
+      // offsetHeight twice against a freshly parsed subtree.
+      const marks = Array.from(stale.querySelectorAll('[aria-label="You"]')).map((u) => ({
+        expanded: u.dataset.expanded === '1',
+        fits: u.dataset.fits === '1',
+        capped: u.classList.contains('turn-collapsed'),
+      }));
       stale.outerHTML = turns[n - 1];
       const fresh = transcriptEl.children[n - 1].querySelectorAll('[aria-label="You"]');
-      wasExpanded.forEach((was, i) => {
-        if (was && fresh[i]) fresh[i].dataset.expanded = '1';
+      marks.forEach((m, i) => {
+        const el = fresh[i];
+        if (!el) return;
+        if (m.expanded) el.dataset.expanded = '1';
+        if (m.fits) el.dataset.fits = '1';
+        if (m.capped) el.classList.add('turn-collapsed');
       });
       renderedTurns = turns.slice();
       applyCollapse();
