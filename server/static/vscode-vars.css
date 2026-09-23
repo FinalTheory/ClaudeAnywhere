@@ -1,0 +1,144 @@
+/* Fallback values for the --vscode-* theme tokens claude-webview.css expects
+   VS Code to inject at runtime. Approximates VS Code's default Dark+ theme —
+   good enough to make the extension's own CSS render sensibly outside VS
+   Code, not a pixel-exact reproduction. Only tokens actually referenced by
+   a rendered chat transcript are covered (buttons, links, code blocks,
+   diffs, lists, menus) — editor-only widgets the transcript never shows
+   (suggest widget, peek view, minimap, per-symbol-kind icons, sticky
+   scroll) are skipped; grep claude-webview.css for `--vscode-` if something
+   still looks unstyled and add the missing token here. */
+
+:root {
+  --vscode-foreground: #cccccc;
+  --vscode-descriptionForeground: #9d9d9d;
+  --vscode-disabledForeground: #6b6b6b;
+  --vscode-errorForeground: #f48771;
+  --vscode-icon-foreground: #cccccc;
+  --vscode-focusBorder: #007fd4;
+  --vscode-contrastBorder: transparent;
+  --vscode-contrastActiveBorder: transparent;
+
+  --vscode-editor-background: #1e1e1e;
+  --vscode-editor-foreground: #d4d4d4;
+  --vscode-editor-font-family: Menlo, Monaco, "Courier New", monospace;
+  --vscode-editor-font-size: 13px;
+  --vscode-editorLineNumber-foreground: #858585;
+  --vscode-editorLineNumber-activeForeground: #c6c6c6;
+  --vscode-editorCursor-foreground: #aeafad;
+  --vscode-editorWhitespace-foreground: #3b3b3b;
+
+  --vscode-sideBar-background: #252526;
+  --vscode-sideBarActivityBarTop-border: #2d2d2d;
+  --vscode-sideBarSectionHeader-border: #3c3c3c;
+  --vscode-panel-border: rgba(128, 128, 128, 0.35);
+  --vscode-widget-border: #303031;
+  --vscode-widget-shadow: rgba(0, 0, 0, 0.36);
+  --vscode-editorWidget-background: #252526;
+  --vscode-editorWidget-foreground: #cccccc;
+  --vscode-editorWidget-border: #454545;
+  --vscode-editorHoverWidget-background: #252526;
+  --vscode-editorHoverWidget-foreground: #cccccc;
+  --vscode-editorHoverWidget-border: #454545;
+
+  --vscode-input-background: #3c3c3c;
+  --vscode-input-foreground: #cccccc;
+  --vscode-input-border: transparent;
+  --vscode-input-placeholderForeground: #a6a6a6;
+  --vscode-inputOption-activeBorder: #007acc;
+  --vscode-inlineChatInput-border: #454545;
+
+  --vscode-button-background: #0e639c;
+  --vscode-button-foreground: #ffffff;
+  --vscode-button-hoverBackground: #1177bb;
+  --vscode-button-border: transparent;
+  --vscode-button-secondaryBackground: #3a3d41;
+  --vscode-button-secondaryForeground: #ffffff;
+  --vscode-button-secondaryHoverBackground: #45494e;
+  --vscode-button-separator: rgba(255, 255, 255, 0.4);
+
+  --vscode-badge-background: #4d4d4d;
+  --vscode-badge-foreground: #ffffff;
+
+  --vscode-banner-background: #04395e;
+  --vscode-banner-foreground: #cccccc;
+  --vscode-banner-iconForeground: #3794ff;
+
+  --vscode-textLink-foreground: #3794ff;
+  --vscode-textLink-activeForeground: #3794ff;
+  --vscode-textPreformat-foreground: #d7ba7d;
+  --vscode-textPreformat-background: rgba(255, 255, 255, 0.1);
+  --vscode-textCodeBlock-background: rgba(10, 10, 10, 0.4);
+  --vscode-chat-slashCommandBackground: #34414b;
+  --vscode-chat-slashCommandForeground: #40a6ff;
+  --vscode-chat-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --vscode-chat-font-size: 13px;
+
+  --vscode-menu-background: #252526;
+  --vscode-menu-foreground: #cccccc;
+  --vscode-menu-border: #454545;
+  --vscode-menu-selectionBackground: #04395e;
+  --vscode-menu-selectionForeground: #ffffff;
+  --vscode-menu-selectionBorder: transparent;
+
+  --vscode-list-hoverBackground: #2a2d2e;
+  --vscode-list-activeSelectionBackground: #094771;
+  --vscode-list-activeSelectionForeground: #ffffff;
+  --vscode-list-dropBackground: #383b3d;
+  --vscode-list-highlightForeground: #18a3ff;
+  --vscode-list-focusHighlightForeground: #18a3ff;
+
+  --vscode-scrollbar-shadow: #000000;
+  --vscode-scrollbarSlider-background: rgba(121, 121, 121, 0.4);
+  --vscode-scrollbarSlider-hoverBackground: rgba(100, 100, 100, 0.7);
+  --vscode-scrollbarSlider-activeBackground: rgba(191, 191, 191, 0.4);
+  --vscode-minimapSlider-background: rgba(121, 121, 121, 0.2);
+  --vscode-minimapSlider-hoverBackground: rgba(100, 100, 100, 0.35);
+  --vscode-minimapSlider-activeBackground: rgba(191, 191, 191, 0.2);
+
+  --vscode-toolbar-hoverBackground: rgba(90, 93, 94, 0.31);
+  --vscode-actionBar-toggledBackground: #383a49;
+  --vscode-keybindingLabel-background: rgba(128, 128, 128, 0.17);
+  --vscode-keybindingLabel-foreground: #cccccc;
+  --vscode-keybindingLabel-border: rgba(51, 51, 51, 0.6);
+  --vscode-keybindingLabel-bottomBorder: rgba(68, 68, 68, 0.6);
+
+  /* Diff rendering — used by tool-call file-edit results, likely visible often */
+  --vscode-diffEditor-insertedTextBackground: rgba(155, 185, 85, 0.2);
+  --vscode-diffEditor-insertedTextBorder: transparent;
+  --vscode-diffEditor-removedTextBackground: rgba(255, 0, 0, 0.2);
+  --vscode-diffEditor-removedTextBorder: transparent;
+  --vscode-diffEditor-insertedLineBackground: rgba(155, 185, 85, 0.13);
+  --vscode-diffEditor-removedLineBackground: rgba(255, 0, 0, 0.13);
+  --vscode-diffEditor-border: #454545;
+  --vscode-diffEditorGutter-insertedLineBackground: rgba(155, 185, 85, 0.13);
+  --vscode-diffEditorGutter-removedLineBackground: rgba(255, 0, 0, 0.13);
+  --vscode-gitDecoration-addedResourceForeground: #81b88b;
+  --vscode-gitDecoration-deletedResourceForeground: #c74e39;
+
+  --vscode-editorError-background: transparent;
+  --vscode-editorError-border: #f48771;
+  --vscode-editorWarning-background: transparent;
+  --vscode-editorWarning-border: #cca700;
+  --vscode-editorInfo-background: transparent;
+  --vscode-editorInfo-border: #3794ff;
+  --vscode-editorHint-border: #6c6c6c;
+  --vscode-problemsErrorIcon-foreground: #f14c4c;
+  --vscode-problemsWarningIcon-foreground: #cca700;
+  --vscode-problemsInfoIcon-foreground: #3794ff;
+
+  --vscode-charts-blue: #3794ff;
+  --vscode-charts-green: #89d185;
+  --vscode-charts-orange: #d18616;
+  --vscode-charts-purple: #c586c0;
+  --vscode-charts-red: #f14c4c;
+  --vscode-charts-yellow: #cca700;
+  --vscode-charts-foreground: #cccccc;
+  --vscode-terminal-ansiCyan: #29b8db;
+
+  --vscode-progressBar-background: #0e70c0;
+  --vscode-editorGutter-background: #1e1e1e;
+  --vscode-editorGutter-commentRangeForeground: #85858570;
+  --vscode-editorCodeLens-foreground: #999999;
+  --vscode-editorLink-activeForeground: #ffffff;
+  --vscode-sash-hoverBorder: #007fd4;
+}

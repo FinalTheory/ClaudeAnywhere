@@ -1,0 +1,234 @@
+/* Load order (see index.html): vscode-vars.css, claude-webview.css, then
+   this file. claude-webview.css is Claude Code's own compiled CSS (copied
+   verbatim from the installed extension — see README), so most of the
+   #transcript content is already styled correctly by it; this file only
+   covers what that stylesheet doesn't: our own page chrome outside
+   #transcript, undoing the global html/body rules it sets that would
+   otherwise leak into the session list/login pages, and neutralizing
+   captured interactive elements that don't actually work here (no click
+   handlers are wired up — we only ever inject static HTML). */
+
+:root {
+  /* THE font size knob. 1 = Claude Code's own normal size. Everything below
+     — both #transcript content (via the two --vscode-*-font-size tokens
+     claude-webview.css keys most of its typography off of) and our own page
+     chrome (session list, header, input, send button) — is sized off this
+     one number via calc(), so this is the only line to touch. */
+  --app-font-scale: 1.2;
+  --vscode-chat-font-size: calc(13px * var(--app-font-scale));
+  --vscode-editor-font-size: calc(13px * var(--app-font-scale));
+  /* THE line-height knob for #transcript content (message text, code
+     blocks). Claude Code's own CSS sets an explicit line-height on these
+     elements tuned for a narrow editor sidebar panel — an explicit
+     declaration always wins over an inherited one regardless of
+     specificity, so this can't just be set once on #transcript and left to
+     cascade down; it's applied directly to message/turn elements further
+     below (search this file for --app-line-height to find that rule if you
+     ever need to move it). */
+  --app-line-height: 1.6;
+}
+
+/* claude-webview.css sets html/body to display:flex (row) for its own
+   single-child layout. That flex context now applies to OUR body too,
+   so our top-level containers need explicit sizing to behave like normal
+   block children again instead of shrink-to-content flex items. */
+html, body {
+  height: 100%;
+  margin: 0;
+  /* iOS Safari's rubber-band overscroll reveals whatever's BEHIND the page
+   * (the browser's own white canvas) when you scroll past the top/bottom —
+   * without a background here, that shows as a flash of white tearing
+   * through the dark theme. background-attachment:fixed keeps it painted
+   * across the whole viewport (including the bounce area) instead of just
+   * the scrollable content's own box. */
+  background: var(--vscode-editor-background, #1e1e1e);
+  background-attachment: fixed;
+}
+body > #session-list,
+body > #session-detail {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+}
+
+#session-list {
+  padding: 12px;
+  padding-top: max(12px, env(safe-area-inset-top));
+  overflow-y: auto;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--vscode-foreground, #ccc);
+  background: var(--vscode-editor-background, #1e1e1e);
+}
+.session-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 6px;
+  border-bottom: 1px solid var(--vscode-panel-border, #333);
+  font-size: calc(15px * var(--app-font-scale));
+}
+.dot {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+.dot.running {
+  background: var(--vscode-charts-green, #3fb950);
+  box-shadow: 0 0 6px rgba(63, 185, 80, 0.5);
+}
+.dot.idle {
+  background: var(--vscode-descriptionForeground, #6e7681);
+}
+
+#session-detail {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+  background: var(--vscode-editor-background, #1e1e1e);
+}
+#back-btn {
+  flex: none;
+  padding: 10px 12px;
+  padding-top: max(10px, env(safe-area-inset-top));
+  background: var(--vscode-sideBar-background, #252526);
+  color: var(--vscode-foreground, #ccc);
+  border: none;
+  border-bottom: 1px solid var(--vscode-panel-border, #333);
+  text-align: left;
+  font-size: calc(15px * var(--app-font-scale));
+}
+#status {
+  flex: none;
+  padding: 4px 12px;
+  font-size: calc(12px * var(--app-font-scale));
+  color: var(--vscode-descriptionForeground, #9aa);
+  background: var(--vscode-sideBar-background, #262626);
+}
+
+#transcript {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  padding: 8px;
+  /* This is its own independently-scrollable box, so it rubber-bands on its
+   * own too (see the html/body comment above for why this matters). */
+  background: var(--vscode-editor-background, #1e1e1e);
+}
+
+#send-form {
+  flex: none;
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  padding-bottom: max(8px, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--vscode-panel-border, #333);
+  background: var(--vscode-sideBar-background, #202020);
+}
+#prompt-input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 18px;
+  border: 1px solid var(--vscode-input-border, #444);
+  background: var(--vscode-input-background, #2a2a2a);
+  color: var(--vscode-input-foreground, #eee);
+  /* 16px+ avoids iOS Safari auto-zooming the page on focus — calc() here
+     only ever scales this UP from 16px (--app-font-scale defaults to 1.5,
+     and isn't meant to go below 1), so that stays true regardless. */
+  font-size: calc(16px * var(--app-font-scale));
+  font-family: inherit;
+  /* textarea, not input — multi-line composition is the point. Auto-grows
+     via JS (app.js) up to this height, then scrolls internally instead of
+     pushing the rest of the page around indefinitely. */
+  resize: none;
+  max-height: 40vh;
+  overflow-y: auto;
+  line-height: 1.35;
+}
+#send-form button[type="submit"] {
+  flex: none;
+  padding: 10px 18px;
+  border-radius: 18px;
+  border: none;
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #fff);
+  font-size: calc(15px * var(--app-font-scale));
+}
+#send-form button[type="submit"]:disabled {
+  background: var(--vscode-button-secondaryBackground, #555);
+  color: var(--vscode-disabledForeground, #999);
+}
+
+/* ---- Captured Claude Code markup, injected into #transcript ---- */
+/* Class names are CSS-module-hashed (turn_07S1Yg etc.) — match on the
+   semantic prefix via [class*="prefix_"] so this survives the hash suffix
+   changing across Claude Code versions. Even the prefix isn't guaranteed
+   stable long-term; see README. */
+
+/* Non-functional here: no click handlers are wired up since we only ever
+   inject static captured HTML, never load Claude's own JS. Claude's input
+   box is replaced by the real one in #send-form below; copy/expand/add/menu
+   buttons would just sit there doing nothing if left visible. */
+#transcript [class*="inputContainer_"],
+#transcript [class*="inputContainerBackground_"],
+#transcript [class*="copyButton_"],
+#transcript [class*="copyResponseButton_"],
+#transcript [class*="expandButton_"],
+#transcript [class*="addButton_"],
+#transcript [class*="addButtonContainer_"],
+#transcript [class*="menuButton_"] {
+  display: none !important;
+}
+
+/* Force-expand anything collapsed/truncated behind a (now non-functional)
+   expand control — otherwise this content is simply unreachable. */
+#transcript [class*="collapsed_"] {
+  max-height: none !important;
+  overflow: visible !important;
+}
+#transcript [class*="truncationGradient_"] {
+  display: none !important;
+}
+
+/* Screen-reader-only content — invisible by design, just making sure this
+   holds without Claude's own stylesheet doing the a11y-hiding trick itself
+   (it should already, via claude-webview.css, but belt and suspenders). */
+#transcript [class*="visuallyHidden_"],
+#transcript [class*="screenReaderTurnHeading_"] {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+}
+
+/* Line spacing — see --app-line-height at the top of this file for the
+   knob. Claude Code's own CSS sets line-height explicitly on these (tuned
+   for a narrow editor sidebar), so it has to be overridden directly on the
+   same elements, not just inherited from a #transcript-level rule. */
+#transcript [class*="message_"],
+#transcript [class*="turn_"],
+#transcript [class*="metaMessage_"] {
+  line-height: var(--app-line-height);
+}
+
+/* Prevent horizontal overflow — the single biggest mobile-layout risk from
+   long code lines / tool output. */
+#transcript pre,
+#transcript code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+}
+#transcript img,
+#transcript svg {
+  max-width: 100%;
+  height: auto;
+}
+#transcript * {
+  max-width: 100%;
+}
