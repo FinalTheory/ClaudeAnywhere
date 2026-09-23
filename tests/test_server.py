@@ -156,6 +156,15 @@ class SessionStateTests(IsolatedState):
         st.apply_resync(["a", "b"])
         self.assertEqual(st.turns, ["a", "b"], "re-sending the same tail must not duplicate it")
 
+    def test_identical_resync_is_idempotent_when_a_turn_repeats(self):
+        # Short messages ("ok", "测试") render to byte-identical HTML, so a
+        # repeated turn is ordinary. Splicing at the first matching turn
+        # instead of the best-matching run duplicates a whole block on the
+        # phone every time the daemon reconnects.
+        st = self.make(["A", "B", "A", "C"])
+        st.apply_resync(["A", "B", "A", "C"])
+        self.assertEqual(st.turns, ["A", "B", "A", "C"])
+
     def test_state_and_load_round_trip(self):
         st = self.make(["a"])
         st.apply_state(True)
@@ -273,6 +282,7 @@ class HttpTests(AioHTTPTestCase, IsolatedState):
             "/login", data={"password": TOKEN}, allow_redirects=False
         )
         self.assertEqual(resp.status, 302)
+        self.assertEqual(resp.headers["Location"], "/", "a good password must open the app")
         self.assertIn(server.COOKIE_NAME, resp.cookies)
         cookie = resp.cookies[server.COOKIE_NAME]
         self.assertTrue(server._verify_cookie(cookie.value))
@@ -416,6 +426,8 @@ class WsFlowTests(AioHTTPTestCase, IsolatedState):
 
         self.assertEqual(got["type"], "resync")
         self.assertEqual(server.sessions["s1"].turns, big, "the store keeps everything")
+        self.assertTrue(got["turns"], "an empty window would blank the phone's transcript")
+        self.assertEqual(got["turns"][-1], big[-1], "the window must end at the newest turn")
         self.assertLess(len(got["turns"]), len(big), "the phone gets only a tail window")
         self.assertEqual(
             got["turns"], big[got["startIndex"]:], "startIndex must locate the window sent"

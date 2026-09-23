@@ -137,12 +137,30 @@ class SessionState:
         # stored (search from the end backward for its first turn) and
         # splice from there; if no overlap is found, treat it as freshly
         # appended content rather than discarding prior history.
-        first = incoming[0]
+        # Matching on the first turn alone is not enough: short messages
+        # ("ok", "测试") render to byte-identical HTML, so a history like
+        # [A, B, A, C] resynced with itself would splice at the *second* A
+        # and produce [A, B, A, B, A, C] — a visibly duplicated block on the
+        # phone, on every daemon reconnect. Score each candidate position by
+        # how far the two sequences actually agree from there, and take the
+        # best; ties go to the latest position, which is what keeps a
+        # streaming edit of the final turn (same first turn, one turn
+        # changed) splicing in place rather than re-appending.
         overlap_at = None
-        for i in range(len(self.turns) - 1, -1, -1):
-            if self.turns[i] == first:
+        best_run = 0
+        for i in range(len(self.turns)):
+            if self.turns[i] != incoming[0]:
+                continue
+            run = 0
+            while (
+                run < len(incoming)
+                and i + run < len(self.turns)
+                and self.turns[i + run] == incoming[run]
+            ):
+                run += 1
+            if run >= best_run:
+                best_run = run
                 overlap_at = i
-                break
         if overlap_at is not None:
             self.turns = self.turns[:overlap_at] + incoming
         else:

@@ -89,6 +89,70 @@ test('SessionWatcher starts with forceResyncNext set', () => {
   assert.deepStrictEqual(w.lastTurns, []);
 });
 
+// --- _tick: the wiring, not just the pieces -------------------------------
+// diffTurns being right and the constructor flag being set are both useless
+// if _tick doesn't pass one to the other. Driving the real _tick is what
+// makes hard-coding `false` for that argument — which restores
+// duplicate-the-whole-conversation-on-every-restart — a failing test.
+
+function tickableWatcher(t, snapshots) {
+  const events = [];
+  let i = 0;
+  t.mock.method(cdp, 'evaluate', async () => snapshots[Math.min(i++, snapshots.length - 1)]);
+  const w = new SessionWatcher('sid', (e) => events.push(e));
+  w.picked = { contextId: 1 };
+  w.client = { send: async () => ({}), ws: { close() {} } };
+  t.after(() => w.close()); // _tick arms the next poll timer; don't leak it
+  return { w, events };
+}
+
+const snap = (turns, running = false) => ({ running, turns, title: null });
+
+test('_tick: a fresh watcher reports its first read as a resync, never an append', async (t) => {
+  const { w, events } = tickableWatcher(t, [snap(['a', 'b'])]);
+  await w._tick();
+  const content = events.filter((e) => e.type !== 'state');
+  assert.deepStrictEqual(content, [{ type: 'resync', sessionId: 'sid', turns: ['a', 'b'] }]);
+  assert.strictEqual(w.forceResyncNext, false, 'the flag is consumed, not left set');
+  assert.deepStrictEqual(w.lastTurns, ['a', 'b'], 'state advanced with the emitted event');
+});
+
+test('_tick: the second read is an append of only what is new', async (t) => {
+  const { w, events } = tickableWatcher(t, [snap(['a']), snap(['a', 'b'])]);
+  await w._tick();
+  await w._tick();
+  const content = events.filter((e) => e.type !== 'state');
+  assert.deepStrictEqual(content.map((e) => e.type), ['resync', 'append']);
+  assert.deepStrictEqual(content[1].turns, ['b'], 'only the new turn goes on the wire');
+});
+
+test('_tick: an unchanged read emits nothing at all', async (t) => {
+  const { w, events } = tickableWatcher(t, [snap(['a']), snap(['a']), snap(['a'])]);
+  await w._tick();
+  await w._tick();
+  await w._tick();
+  assert.deepStrictEqual(
+    events.filter((e) => e.type !== 'state').map((e) => e.type),
+    ['resync'],
+    'polling an idle session must not put traffic on the wire',
+  );
+});
+
+test('_tick: a running-state flip is reported once, not on every poll', async (t) => {
+  const { w, events } = tickableWatcher(t, [
+    snap(['a'], false),
+    snap(['a'], true),
+    snap(['a'], true),
+  ]);
+  await w._tick();
+  await w._tick();
+  await w._tick();
+  assert.deepStrictEqual(
+    events.filter((e) => e.type === 'state').map((e) => e.running),
+    [false, true],
+  );
+});
+
 // --- arraysEqual ----------------------------------------------------------
 
 test('arraysEqual: length, order and content all matter', () => {
