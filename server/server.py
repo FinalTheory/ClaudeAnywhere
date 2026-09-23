@@ -40,7 +40,7 @@ HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8764"))
 DATA_DIR = Path(__file__).parent / "data"
 INITIAL_LOAD_BYTES = 2048  # tail context (in whole turns) a phone gets on open
-MAX_SESSION_BYTES = 5_000_000  # per-session cap, oldest whole turns dropped first
+MAX_SESSION_BYTES = 1_000_000  # per-session cap, oldest whole turns dropped first
 COOKIE_NAME = "evi_remote_auth"
 COOKIE_MAX_AGE = 30 * 24 * 3600  # 30 days
 
@@ -168,6 +168,48 @@ def get_session(session_id: str) -> SessionState:
     if session_id not in sessions:
         sessions[session_id] = SessionState(session_id)
     return sessions[session_id]
+
+
+SESSION_TTL_SECONDS = 7 * 24 * 3600
+
+
+def _sweep_stale_sessions() -> int:
+    now = time.time()
+    stale = [
+        sid for sid, st in sessions.items()
+        if now - st.last_seen > SESSION_TTL_SECONDS and not st.phone_sockets
+    ]
+    for sid in stale:
+        st = sessions.pop(sid)
+        try:
+            st.path().unlink(missing_ok=True)
+        except OSError:
+            pass
+    return len(stale)
+
+
+async def _cleanup_loop(app: web.Application):
+    # Sweep once immediately (covers "server was down for a while, catch up
+    # now") and then hourly — this doesn't need to be precise to the day, it
+    # just needs to eventually reclaim disk/memory for sessions nobody's
+    # touched in a week.
+    while True:
+        removed = _sweep_stale_sessions()
+        if removed:
+            print(f"[cleanup] removed {removed} session(s) untouched for {SESSION_TTL_SECONDS // 86400}+ days")
+        await asyncio.sleep(3600)
+
+
+async def _start_background_tasks(app: web.Application):
+    app["cleanup_task"] = asyncio.create_task(_cleanup_loop(app))
+
+
+async def _stop_background_tasks(app: web.Application):
+    app["cleanup_task"].cancel()
+    try:
+        await app["cleanup_task"]
+    except asyncio.CancelledError:
+        pass
 
 
 def tail_window(turns: list[str], max_bytes: int) -> tuple[list[str], int]:
@@ -459,31 +501,20 @@ async def healthz(request: web.Request) -> web.Response:
     })
 
 
-@web.middleware
-async def no_cache_static(request: web.Request, handler):
-    # This is under active development — JS/CSS change every few minutes via
-    # the auto-deploy loop, with no cache-busting filename/query hash. Mobile
-    # Safari caches static assets aggressively; without this, "fixed and
-    # deployed" and "the phone is still running the old file" are
-    # indistinguishable from the outside. Static-only, not app.py logic.
-    resp = await handler(request)
-    if request.path.startswith("/static/"):
-        resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
 def make_app() -> web.Application:
-    app = web.Application(middlewares=[no_cache_static])
-    app.router.add_get("/", lambda r: web.HTTPFound("/app"))
+    app = web.Application()
+    app.router.add_get("/", app_page)
     app.router.add_get("/healthz", healthz)
     app.router.add_get("/login", login_page)
     app.router.add_post("/login", login_page)
-    app.router.add_get("/app", app_page)
+    app.router.add_get("/app", app_page)  # kept as an alias, in case anything still links here
     app.router.add_get("/api/sessions", api_sessions)
     app.router.add_get("/api/session/{session_id}/history", api_history)
     app.router.add_get("/ws/client", ws_client_handler)
     app.router.add_get("/ws/phone/{session_id}", ws_phone_handler)
     app.router.add_static("/static/", STATIC_DIR)
+    app.on_startup.append(_start_background_tasks)
+    app.on_cleanup.append(_stop_background_tasks)
     return app
 
 

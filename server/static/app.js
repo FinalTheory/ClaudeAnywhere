@@ -16,35 +16,62 @@ let ws = null;
 // currently loaded in the DOM — the cursor for "load more history above".
 let loadedStartIndex = 0;
 let hasMore = true;
-// What we last optimistically-cleared from the input, in case the ack that
-// comes back says it never actually sent — see the submit_ack handler.
-let lastSentText = null;
+// Tracks the one in-flight send, so we can tell "no ack ever arrived" (a
+// silent delivery failure — see the timeout below) apart from "explicit
+// failure ack", and restore the text either way.
+let pendingSend = null; // { text, timeoutId }
+const SUBMIT_ACK_TIMEOUT_MS = 5000;
 
 async function loadSessionList() {
-  listEl.innerHTML = 'Loading...';
+  listEl.innerHTML = '<div class="list-header">Sessions</div><div class="list-loading">Loading…</div>';
   const res = await fetch('/api/sessions');
   const data = await res.json();
-  listEl.innerHTML = '';
+  listEl.innerHTML = '<div class="list-header">Sessions</div>';
   if (data.error) {
+    const wrap = document.createElement('div');
+    wrap.className = 'list-error';
     const p = document.createElement('p');
     p.textContent = `Client daemon not connected: ${data.error}`;
     const retry = document.createElement('button');
     retry.textContent = 'Retry';
     retry.onclick = loadSessionList;
-    listEl.append(p, retry);
+    wrap.append(p, retry);
+    listEl.appendChild(wrap);
+    return;
+  }
+  if (data.sessions.length === 0) {
+    const p = document.createElement('p');
+    p.className = 'list-empty';
+    p.textContent = 'No open Claude Code sessions right now.';
+    listEl.appendChild(p);
     return;
   }
   for (const s of data.sessions) {
     const div = document.createElement('div');
     div.className = 'session-item';
+
     const dot = document.createElement('span');
     dot.className = `dot ${s.running ? 'running' : 'idle'}`;
+
+    const text = document.createElement('div');
+    text.className = 'session-item-text';
+    const title = document.createElement('div');
+    title.className = 'session-item-title';
     // Prefer the readable title (document.title inside that session's own
-    // webview) over the raw UUID — falls back to the truncated preview text
-    // if the title turned out not to be conversation-specific (unverified
-    // as of writing, see the comment on POLL_EXPR in daemon.js).
-    const label = s.title || `${s.sessionId.slice(0, 8)} — ${s.preview || '(empty)'}`;
-    div.append(dot, document.createTextNode(` ${label}`));
+    // webview) over the raw session id — falls back to the id if the title
+    // turned out not to be conversation-specific (unverified as of writing,
+    // see the comment on POLL_EXPR in daemon.js).
+    title.textContent = s.title || s.sessionId.slice(0, 8);
+    const preview = document.createElement('div');
+    preview.className = 'session-item-preview';
+    preview.textContent = s.preview || '(empty)';
+    text.append(title, preview);
+
+    const chevron = document.createElement('span');
+    chevron.className = 'chevron';
+    chevron.textContent = '›'; // ›
+
+    div.append(dot, text, chevron);
     div.onclick = () => openSession(s.sessionId);
     listEl.appendChild(div);
   }
@@ -110,6 +137,7 @@ function connectPhoneWs(sessionId, delay) {
     } else if (msg.type === 'state') {
       setStatus(msg.running);
     } else if (msg.type === 'submit_ack') {
+      if (pendingSend) clearTimeout(pendingSend.timeoutId);
       if (!msg.ok) {
         setStatus(null, `send failed: ${msg.error || 'unknown error'}`);
         // The input was cleared optimistically on send (see sendForm.onsubmit)
@@ -118,22 +146,27 @@ function connectPhoneWs(sessionId, delay) {
         // typed. Restore it, but only into an empty box: if they've already
         // started composing something new by the time this ack arrives,
         // don't clobber that.
-        if (lastSentText && !promptInput.value) {
-          promptInput.value = lastSentText;
+        if (pendingSend && !promptInput.value) {
+          promptInput.value = pendingSend.text;
           promptInput.dispatchEvent(new Event('input')); // re-trigger auto-grow
         }
       }
-      lastSentText = null;
+      pendingSend = null;
     }
   };
 }
 
 function setStatus(running, note) {
   statusEl.textContent = note || (running ? 'Running...' : running === false ? 'Idle' : 'Unknown');
-  // Only disable on a confirmed "still running" — an unknown/null state
-  // (e.g. right after connecting, before the first probe result) defaults
-  // to enabled so a flaky signal can't permanently lock the input.
-  sendBtn.disabled = running === true;
+  // Not a hard disable anymore — confirmed in practice this deadlocks: the
+  // send-button/aria-label flip means "busy" whenever the assistant's turn
+  // isn't finished, which is ALSO true while it's blocked on a pending
+  // AskUserQuestion/interactive tool call — the one case where replying is
+  // exactly how you unblock it. Disabling actually prevented that reply.
+  // "running" was only ever meant to stop you interrupting active
+  // generation with an unrelated message — a soft visual hint (dim, still
+  // clickable) serves that without locking out the one case it breaks.
+  sendBtn.classList.toggle('maybe-busy', running === true);
 }
 
 function scrollToBottom() {
@@ -190,7 +223,6 @@ promptInput.addEventListener('input', () => {
 
 sendForm.onsubmit = (e) => {
   e.preventDefault();
-  if (sendBtn.disabled) return; // still running — belt and suspenders alongside the disabled attribute
   const text = promptInput.value.trim();
   if (!text) return;
   // The VPS restarts on every deploy, which drops this socket for a moment
@@ -203,10 +235,28 @@ sendForm.onsubmit = (e) => {
     setStatus(null, 'Not connected — reconnecting, try again in a moment');
     return;
   }
-  lastSentText = text;
   ws.send(JSON.stringify({ type: 'submit', text }));
   promptInput.value = '';
   promptInput.style.height = 'auto';
+  if (pendingSend) clearTimeout(pendingSend.timeoutId); // shouldn't happen, but don't leak a timer if it does
+  pendingSend = {
+    text,
+    timeoutId: setTimeout(() => {
+      // readyState === OPEN at send time is not proof of delivery — send()
+      // is fire-and-forget at the WebSocket API level, and a connection can
+      // die between the call and the frame actually reaching the server
+      // with no error ever surfaced to us (confirmed in practice: a message
+      // vanished with zero error shown, during a window of daemon<->VPS
+      // reconnect churn). A submit_ack that never arrives is exactly as
+      // real a failure as one that explicitly says ok:false.
+      setStatus(null, 'No response — message may not have sent, restoring it');
+      if (pendingSend && !promptInput.value) {
+        promptInput.value = pendingSend.text;
+        promptInput.dispatchEvent(new Event('input'));
+      }
+      pendingSend = null;
+    }, SUBMIT_ACK_TIMEOUT_MS),
+  };
 };
 
 loadSessionList();
