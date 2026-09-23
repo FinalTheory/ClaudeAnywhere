@@ -169,10 +169,24 @@ class SessionState:
             if run >= best_run:
                 best_run = run
                 overlap_at = i
-        if overlap_at is not None:
-            self.turns = self.turns[:overlap_at] + incoming
-        else:
-            self.turns = self.turns + incoming
+        # No alignment at all means every turn the tail describes has
+        # changed since we stored it. Splice at the bound anyway rather
+        # than appending: the tail is the last len(incoming) turns of the
+        # live DOM, so putting it anywhere else duplicates them.
+        #
+        # Appending here was visible on a brand-new session. Its first
+        # exchange is a single turn that grows as the reply streams, so
+        # incoming[0] is the turn being edited and never matches what is
+        # stored — every poll added another snapshot, and the phone showed
+        # the same reply three, four, five times over.
+        #
+        # This only ever rewrites as many turns as the daemon described.
+        # Below MAX_RESYNC_TURNS the tail is the whole DOM, so replacing
+        # from the bound is exactly right; above it, older history past
+        # the tail's reach is untouched either way.
+        if overlap_at is None:
+            overlap_at = max(0, earliest)
+        self.turns = self.turns[:overlap_at] + incoming
         self._cap()
         self.last_seen = time.time()
         self.save()

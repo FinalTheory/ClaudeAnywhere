@@ -126,14 +126,33 @@ class SessionStateTests(IsolatedState):
         st.apply_resync(["t2", "t3-updated", "t4"])
         self.assertEqual(st.turns, ["t1", "t2", "t3-updated", "t4"])
 
-    def test_resync_without_overlap_appends_rather_than_discarding(self):
+    def test_resync_without_overlap_replaces_what_the_tail_describes(self):
+        # A tail with no alignment means every turn it describes has
+        # changed. It still describes the last len(incoming) turns of the
+        # live DOM, so it belongs there — appending would show both the
+        # stale and the current copy.
         st = self.make(["old1", "old2"])
         st.apply_resync(["new1", "new2"])
+        self.assertEqual(st.turns, ["new1", "new2"])
+
+    def test_resync_without_overlap_keeps_history_the_tail_cannot_reach(self):
+        st = self.make(["keep1", "keep2", "old"])
+        st.apply_resync(["new"])
         self.assertEqual(
             st.turns,
-            ["old1", "old2", "new1", "new2"],
-            "prior history is kept when no splice point can be found",
+            ["keep1", "keep2", "new"],
+            "a one-turn tail rewrites one turn, never the history behind it",
         )
+
+    def test_a_streaming_first_exchange_does_not_accumulate_snapshots(self):
+        # A new session's first exchange is a single turn that grows as the
+        # reply streams. incoming[0] is therefore the turn being edited and
+        # never matches what is stored; appending on that basis showed the
+        # same reply once per poll tick.
+        st = self.make()
+        for snapshot in ["<t>partial</t>", "<t>partly done</t>", "<t>complete</t>"]:
+            st.apply_resync([snapshot])
+        self.assertEqual(st.turns, ["<t>complete</t>"])
 
     def test_resync_onto_empty_history_seeds_it(self):
         st = self.make()

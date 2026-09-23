@@ -46,8 +46,11 @@ Three places have earned scrutiny, because each has produced a visible defect:
    the sequences agree, and never consider a position earlier than
    `len(turns) - len(incoming)`. Dropping either one corrupts the transcript in
    a different direction; both directions have happened. Three invariants hold
-   and are tested by brute force — the result never shortens, always ends with
-   exactly what was sent, and applying the same tail twice is a no-op.
+   of the reconciled result **before `_cap()` runs**, and are tested by brute
+   force: it never shortens, always ends with exactly what was sent, and
+   applying the same tail twice is a no-op. The cap is then free to drop whole
+   turns off the front, so none of the three survive it — that is the size
+   policy working, not a violation.
 2. **`diffTurns` + `SessionWatcher.forceResyncNext`** (`client/daemon.js`) — a
    fresh watcher must report its first read as a `resync`, never an `append`.
    `[]` is a prefix of anything, so without the flag a restart appends a full
