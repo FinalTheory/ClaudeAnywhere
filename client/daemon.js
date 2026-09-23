@@ -339,9 +339,15 @@ class Daemon {
     this.ws = null;
     this.watchers = new Map(); // sessionId -> SessionWatcher
     this.reconnectDelay = 1000;
+    // Bumped on every connect and on every forced cycle. A socket's own
+    // listeners capture the generation they were installed under and do
+    // nothing once it is stale, so a socket we have given up on cannot
+    // schedule a second reconnect on top of the one already running.
+    this.generation = 0;
   }
 
   connect() {
+    const gen = ++this.generation;
     console.error(`Connecting to ${VPS_WS_URL} ...`);
     this.ws = new WebSocket(VPS_WS_URL);
     this.ws.addEventListener('open', () => {
@@ -351,6 +357,7 @@ class Daemon {
     });
     this.ws.addEventListener('message', (ev) => this._handleMessage(ev.data));
     this.ws.addEventListener('close', (ev) => {
+      if (gen !== this.generation) return; // superseded; a reconnect is already in flight
       // code/reason are the actual diagnostic here — e.g. 1009 means a
       // frame exceeded a size limit somewhere in the chain, 1006 is an
       // abnormal/network-level close with no close frame, 1011 is a server
@@ -368,6 +375,23 @@ class Daemon {
       console.error(`WebSocket error: ${ev.message || ev}`);
       // 'close' fires right after; reconnect logic lives there.
     });
+  }
+
+  // Abandon the current socket and dial again immediately, without waiting
+  // for a close event that may never come.
+  forceReconnect(reason) {
+    console.error(`${reason} — cycling the VPS link`);
+    const stale = this.ws;
+    this.generation++; // orphans stale's listeners; see connect()
+    for (const w of this.watchers.values()) w.close();
+    this.watchers.clear();
+    try {
+      stale && stale.close();
+    } catch (e) {
+      // a dead socket may refuse even this
+    }
+    this.reconnectDelay = 1000;
+    this.connect();
   }
 
   _send(obj) {
@@ -501,6 +525,40 @@ class Daemon {
   }
 }
 
+// --- sleep/wake detection -------------------------------------------------
+// A laptop lid closing does not close its TCP connections. They are left
+// half-open: the peer never sends FIN or RST that this side can see, so no
+// 'close' event fires, readyState stays OPEN, and _send writes into a black
+// hole. Every reconnect path in this file hangs off 'close', so after a
+// suspend the daemon looks connected and is not — which is exactly the
+// "nothing reconnected after the MacBook woke" symptom.
+//
+// The suspend itself is observable without any platform API: a timer that
+// should fire every WAKE_PROBE_MS fires far later instead, because the
+// whole process was frozen. Wall-clock gap is the signal.
+//
+// Deliberately not a heartbeat. The server already pings at 30s and the
+// WebSocket layer pongs without telling us, so ping traffic proves nothing
+// at this level; and an application-level ping would still need a timeout
+// to interpret its own silence, which is a second timer doing worse what
+// this one does directly.
+const WAKE_PROBE_MS = 5000;
+const WAKE_GAP_MS = 30000; // generous: normal event-loop lag is milliseconds
+
+function watchForWake(daemon) {
+  let last = Date.now();
+  const timer = setInterval(() => {
+    const now = Date.now();
+    const gap = now - last;
+    last = now;
+    if (gap > WAKE_GAP_MS) {
+      daemon.forceReconnect(`Host was suspended for ~${Math.round(gap / 1000)}s`);
+    }
+  }, WAKE_PROBE_MS);
+  timer.unref && timer.unref(); // never hold the process open on its own
+  return timer;
+}
+
 // --- optional: auto-deploy server/ to the VPS on save --------------------
 // Merged in here rather than kept as a separate script so one `node --watch`
 // loop restarts the daemon AND pushes server/ changes — a single "edit,
@@ -547,11 +605,16 @@ function startDeployWatch() {
 if (require.main === module) {
   installFileLogging();
   requireEnv();
-  new Daemon().connect();
+  const daemon = new Daemon();
+  daemon.connect();
+  watchForWake(daemon);
   if (DEPLOY_TARGET) startDeployWatch();
 }
 
 module.exports = {
+  watchForWake,
+  WAKE_PROBE_MS,
+  WAKE_GAP_MS,
   diffTurns,
   arraysEqual,
   stripTags,

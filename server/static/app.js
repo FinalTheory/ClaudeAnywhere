@@ -102,12 +102,18 @@ function openSession(sessionId) {
 // The VPS restarts on every deploy (auto-restart-on-file-change is the whole
 // point of the daemon/deploy-watch loop) — that drops this socket, so
 // reconnect-with-backoff isn't optional here, it's load-bearing.
+let wsGeneration = 0;
+
 function connectPhoneWs(sessionId, delay) {
   if (sessionId !== currentSessionId) return; // user navigated away meanwhile
+  const gen = ++wsGeneration;
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws/phone/${sessionId}`);
   ws.onclose = () => {
-    if (sessionId !== currentSessionId) return;
+    // A socket we have already replaced must not schedule a second dial on
+    // top of the one running — the phone would end up holding two, each
+    // rendering into the same transcript.
+    if (gen !== wsGeneration || sessionId !== currentSessionId) return;
     const nextDelay = Math.min((delay || 500) * 2, 8000);
     setTimeout(() => connectPhoneWs(sessionId, nextDelay), delay || 500);
   };
@@ -361,6 +367,17 @@ transcriptEl.addEventListener('scroll', async () => {
   } finally {
     loadingMore = false;
   }
+});
+
+// Coming back to a backgrounded tab. iOS suspends the page rather than
+// closing it, so the socket can be dead with no close event delivered
+// until much later, or the backoff can have grown to 8s of doing nothing
+// while you are looking at a stale transcript. Neither is visible: the
+// view just stops updating. Dial straight away instead of waiting.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !currentSessionId) return;
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+  connectPhoneWs(currentSessionId);
 });
 
 backBtn.onclick = () => {

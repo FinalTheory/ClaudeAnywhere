@@ -9,6 +9,10 @@ const assert = require('node:assert');
 
 const cdp = require('../cdp-client.js');
 const {
+  watchForWake,
+  WAKE_PROBE_MS,
+  WAKE_GAP_MS,
+  Daemon,
   diffTurns,
   arraysEqual,
   stripTags,
@@ -346,4 +350,119 @@ test('submit: a mid-message injection failure does not submit a partial message'
     [0],
     'only the line break already dispatched; no Cmd+Enter submit',
   );
+});
+
+// --- reconnect after a suspend -------------------------------------------
+// A closed lid leaves TCP half-open: no FIN, no RST, no 'close' event, and
+// readyState stays OPEN. Every reconnect path hangs off 'close', so nothing
+// notices. These pin the two pieces that make waking up recover.
+
+function fakeSocketClass(sockets) {
+  return class FakeWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.readyState = 1;
+      this.listeners = {};
+      this.closed = false;
+      sockets.push(this);
+    }
+    addEventListener(type, fn) {
+      (this.listeners[type] ||= []).push(fn);
+    }
+    emit(type, ev) {
+      for (const fn of this.listeners[type] || []) fn(ev || {});
+    }
+    send() {}
+    close() {
+      this.closed = true;
+    }
+  };
+}
+
+function withFakeSockets(t) {
+  const sockets = [];
+  const original = global.WebSocket;
+  global.WebSocket = fakeSocketClass(sockets);
+  global.WebSocket.OPEN = 1;
+  t.after(() => {
+    global.WebSocket = original;
+  });
+  return sockets;
+}
+
+test('forceReconnect dials again without waiting for a close event', async (t) => {
+  const sockets = withFakeSockets(t);
+  const d = new Daemon();
+  d.connect();
+  assert.strictEqual(sockets.length, 1);
+
+  d.forceReconnect('test');
+  assert.strictEqual(sockets.length, 2, 'a new socket is opened immediately');
+  assert.ok(sockets[0].closed, 'the abandoned socket is closed');
+});
+
+test('an abandoned socket closing later does not schedule a second reconnect', async (t) => {
+  // The half-open socket can come back to life minutes later and fire
+  // close. Without the generation guard that close handler dials again on
+  // top of the connection already running, and the daemon ends up with two.
+  const sockets = withFakeSockets(t);
+  const d = new Daemon();
+  d.connect();
+  d.forceReconnect('test');
+  assert.strictEqual(sockets.length, 2);
+
+  sockets[0].emit('close', { code: 1006, reason: '', wasClean: false });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.strictEqual(sockets.length, 2, 'the stale close is ignored');
+});
+
+test('forceReconnect drops the watchers, so a fresh subscribe re-resyncs', async (t) => {
+  // Watchers hold CDP sockets that the suspend killed too, and their
+  // lastTurns would otherwise make the next poll look like an append.
+  const sockets = withFakeSockets(t);
+  const d = new Daemon();
+  d.connect();
+  const w = new SessionWatcher('sid', () => {});
+  w.client = { ws: { close() {} } };
+  d.watchers.set('sid', w);
+
+  d.forceReconnect('test');
+  assert.strictEqual(d.watchers.size, 0);
+  assert.strictEqual(w.closed, true);
+});
+
+test('watchForWake fires only when the clock jumped, not on normal ticks', async (t) => {
+  const calls = [];
+  const fake = { forceReconnect: (reason) => calls.push(reason) };
+  const realNow = Date.now;
+  let clock = 1_000_000;
+  Date.now = () => clock;
+  t.after(() => {
+    Date.now = realNow;
+  });
+
+  // Drive the interval by hand rather than waiting WAKE_PROBE_MS of real time.
+  const timers = [];
+  const realSetInterval = global.setInterval;
+  global.setInterval = (fn) => {
+    timers.push(fn);
+    return { unref() {} };
+  };
+  t.after(() => {
+    global.setInterval = realSetInterval;
+  });
+
+  watchForWake(fake);
+  const tick = timers[0];
+
+  clock += WAKE_PROBE_MS; tick();
+  clock += WAKE_PROBE_MS; tick();
+  assert.deepStrictEqual(calls, [], 'ordinary ticks are not a wake');
+
+  clock += WAKE_GAP_MS + 1; tick();
+  assert.strictEqual(calls.length, 1, 'a gap past the threshold is');
+  assert.match(calls[0], /suspended/);
+
+  clock += WAKE_PROBE_MS; tick();
+  assert.strictEqual(calls.length, 1, 'and it does not keep firing afterwards');
 });
