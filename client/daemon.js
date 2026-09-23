@@ -137,7 +137,15 @@ const POLL_EXPR = `
     // Verified empirically to be null/non-conversation-specific for this
     // extension's webviews — kept in case a future build changes that, but
     // don't rely on it; see inspect-tabs.js for the fallback approach.
-    title: document.title || null
+    title: document.title || null,
+    // Claude's own session uuid for this conversation, the join to the
+    // names in the sidebar (see readSessionNames in cdp-client.js).
+    // Absent on some webviews — one of four lacked it when this was
+    // measured — so it is a nicety, never load-bearing for addressing.
+    sessionUuid: (function () {
+      const el = document.querySelector('[data-initial-session]');
+      return el ? el.getAttribute('data-initial-session') : null;
+    })()
   };
 })()
 `;
@@ -200,6 +208,30 @@ function diffTurns(lastTurns, turns, forceResync) {
   return { kind: 'resync', turns: turns.slice(-MAX_RESYNC_TURNS) };
 }
 
+// Turn (webview id -> Claude session uuid) plus (uuid -> name) into
+// (webview id -> title). Separate from the CDP plumbing so the one rule
+// with judgment in it can be tested.
+//
+// A uuid claimed by two webviews is dropped rather than guessed at. The
+// attribute is named `data-initial-session`, so if a webview can ever be
+// reused for a second conversation its value would be stale, and a stale
+// value shows up exactly as two webviews claiming one uuid. A missing
+// title falls back to the session id, which is ugly; a wrong title names
+// someone else's conversation, which is worse.
+function resolveTitles(claims, names) {
+  const claimants = new Map();
+  for (const [, uuid] of claims) {
+    if (!uuid) continue;
+    claimants.set(uuid, (claimants.get(uuid) || 0) + 1);
+  }
+  const titles = new Map();
+  for (const [sessionId, uuid] of claims) {
+    const contested = uuid && claimants.get(uuid) > 1;
+    titles.set(sessionId, !uuid || contested ? null : names[uuid] || null);
+  }
+  return titles;
+}
+
 // Cmd+Enter submits in this UI (confirmed empirically — plain Enter does
 // not). modifiers bitmask: Alt=1, Ctrl=2, Meta/Cmd=4, Shift=8.
 const CMD_MODIFIER = 4;
@@ -234,6 +266,7 @@ class SessionWatcher {
     this.lastTurns = [];
     this.lastRunning = null;
     this.lastTitle = null;
+    this.lastSessionUuid = null;
     this.timer = null;
     this.closed = false;
     // Every fresh subscribe (including after a daemon process restart, which
@@ -274,6 +307,7 @@ class SessionWatcher {
     try {
       const result = await cdp.evaluate(this.client, POLL_EXPR, this.picked.contextId);
       if (result.title) this.lastTitle = result.title;
+      if (result.sessionUuid) this.lastSessionUuid = result.sessionUuid;
       if (result.running !== null && result.running !== this.lastRunning) {
         this.lastRunning = result.running;
         this.onEvent({ type: 'state', sessionId: this.sessionId, running: result.running });
@@ -477,10 +511,14 @@ class Daemon {
 
   async _listSessions() {
     const targets = await cdp.listClaudeSessions(CDP_PORT);
+    // One read of the sidebar for the whole list, not one per session.
+    const names = await cdp.readSessionNames(CDP_PORT);
+    const claims = new Map();
     const sessions = [];
     for (const t of targets) {
       const existing = this.watchers.get(t.sessionId);
       if (existing) {
+        claims.set(t.sessionId, existing.lastSessionUuid);
         sessions.push({
           sessionId: t.sessionId,
           title: existing.lastTitle,
@@ -506,6 +544,7 @@ class Daemon {
           preview = stripTags(result.turns.join('')).slice(-150);
           running = result.running;
           title = result.title;
+          claims.set(t.sessionId, result.sessionUuid);
         }
         sessions.push({ sessionId: t.sessionId, title, preview, running });
       } catch (err) {
@@ -520,6 +559,12 @@ class Daemon {
           // already gone
         }
       }
+    }
+    // The conversation's name wins over document.title, which measured
+    // null on every webview here.
+    const titles = resolveTitles(claims, names);
+    for (const s of sessions) {
+      s.title = titles.get(s.sessionId) || s.title;
     }
     return sessions;
   }
@@ -612,6 +657,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  resolveTitles,
   watchForWake,
   WAKE_PROBE_MS,
   WAKE_GAP_MS,

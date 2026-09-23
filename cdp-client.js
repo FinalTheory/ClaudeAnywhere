@@ -139,7 +139,66 @@ async function listClaudeSessions(port) {
     });
 }
 
+// Claude Code's sidebar (the session picker, purpose=webviewView) lists
+// every session as `id="sessions-list-row-<uuid>"` with the name in a
+// `sessionName_*` child. That uuid is Claude's own session id — the same
+// one an editor webview carries as `data-initial-session` — so the two
+// together name a conversation without touching any VS Code internals.
+//
+// The VS Code route was tried first and abandoned: the editor tab does
+// carry the label, but keyed by a panel uuid that appears nowhere else in
+// the workbench DOM, and pairing tabs to webviews by document order is
+// wrong — measured once with the active tab first in order and its webview
+// third. Only the active pair is identifiable there, so it could name one
+// conversation at a time.
+const SESSION_NAMES_EXPR = `
+(function () {
+  const out = {};
+  for (const row of document.querySelectorAll('[id^="sessions-list-row-"]')) {
+    const name = row.querySelector('[class*="sessionName"]');
+    const text = name && name.textContent.trim();
+    if (text) out[row.id.replace('sessions-list-row-', '')] = text.slice(0, 80);
+  }
+  return out;
+})()
+`;
+
+// uuid -> conversation name, or {} when the sidebar isn't open. Never
+// throws: a missing name costs a nicer label, and is not worth failing the
+// session list over.
+async function readSessionNames(port) {
+  let client;
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/json/list`);
+    if (!res.ok) return {};
+    const targets = await res.json();
+    const sidebar = targets.find(
+      (t) =>
+        t.type === 'iframe' &&
+        t.url &&
+        t.url.includes('extensionId=Anthropic.claude-code') &&
+        t.url.includes('purpose=webviewView')
+    );
+    if (!sidebar) return {};
+    client = await connect(sidebar);
+    const frames = await getFrames(client);
+    const picked = await pickContentFrame(client, frames);
+    if (!picked) return {};
+    return (await evaluate(client, SESSION_NAMES_EXPR, picked.contextId)) || {};
+  } catch (err) {
+    return {};
+  } finally {
+    try {
+      client && client.ws.close();
+    } catch (e) {
+      // already gone
+    }
+  }
+}
+
 module.exports = {
+  readSessionNames,
+  SESSION_NAMES_EXPR,
   findTarget,
   connect,
   evaluate,

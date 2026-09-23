@@ -24,6 +24,9 @@ server/static/claude-webview.css
 /read-transcript.js
 /read-transcript-html.js
 /probe-titles.js
+/probe-titles2.js
+/probe-titles3.js
+/result.txt
 /scan-frames.js
 /send-prompt.js
 /verify-push.js

@@ -9,6 +9,7 @@ const assert = require('node:assert');
 
 const cdp = require('../cdp-client.js');
 const {
+  resolveTitles,
   watchForWake,
   WAKE_PROBE_MS,
   WAKE_GAP_MS,
@@ -465,4 +466,48 @@ test('watchForWake fires only when the clock jumped, not on normal ticks', async
 
   clock += WAKE_PROBE_MS; tick();
   assert.strictEqual(calls.length, 1, 'and it does not keep firing afterwards');
+});
+
+// --- resolveTitles: naming a conversation ---------------------------------
+// Editor webviews report their Claude session uuid as data-initial-session;
+// the sidebar maps that uuid to the name shown on the tab. Measured on a
+// real window: three of four webviews carried the attribute.
+
+test('resolveTitles: names a session whose uuid the sidebar knows', () => {
+  const titles = resolveTitles(
+    new Map([['wv-1', 'uuid-a']]),
+    { 'uuid-a': 'EKP-63451' },
+  );
+  assert.strictEqual(titles.get('wv-1'), 'EKP-63451');
+});
+
+test('resolveTitles: a webview without the attribute gets no title', () => {
+  // One of four lacked it; the phone falls back to the session id.
+  const titles = resolveTitles(new Map([['wv-1', null]]), { 'uuid-a': 'EKP-1' });
+  assert.strictEqual(titles.get('wv-1'), null);
+});
+
+test('resolveTitles: a uuid the sidebar does not list gets no title', () => {
+  // The sidebar can be closed, or the session archived out of the list.
+  const titles = resolveTitles(new Map([['wv-1', 'uuid-z']]), { 'uuid-a': 'EKP-1' });
+  assert.strictEqual(titles.get('wv-1'), null);
+});
+
+test('resolveTitles: a contested uuid names neither webview', () => {
+  // The attribute is data-INITIAL-session. If a webview is ever reused for
+  // a second conversation its value goes stale, and that shows up as two
+  // webviews claiming one uuid. Naming both would put someone else's
+  // conversation title on a session; no title is the safe answer.
+  const titles = resolveTitles(
+    new Map([['wv-1', 'uuid-a'], ['wv-2', 'uuid-a'], ['wv-3', 'uuid-b']]),
+    { 'uuid-a': 'EKP-1', 'uuid-b': 'EKP-2' },
+  );
+  assert.strictEqual(titles.get('wv-1'), null);
+  assert.strictEqual(titles.get('wv-2'), null);
+  assert.strictEqual(titles.get('wv-3'), 'EKP-2', 'an uncontested neighbour is unaffected');
+});
+
+test('resolveTitles: no sidebar at all is empty titles, not a throw', () => {
+  const titles = resolveTitles(new Map([['wv-1', 'uuid-a']]), {});
+  assert.strictEqual(titles.get('wv-1'), null);
 });
