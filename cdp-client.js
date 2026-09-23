@@ -285,7 +285,6 @@ module.exports = {
   pickUniquePair,
   readActiveWebviewTitle,
   readSessionNames,
-  SESSION_NAMES_EXPR,
   findTarget,
   connect,
   evaluate,

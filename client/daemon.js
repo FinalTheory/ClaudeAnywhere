@@ -143,10 +143,6 @@ const POLL_EXPR = `
   return {
     running: btn ? btn.getAttribute('aria-label') === 'Stop' : null,
     turns,
-    // Verified empirically to be null/non-conversation-specific for this
-    // extension's webviews — kept in case a future build changes that, but
-    // don't rely on it; see inspect-tabs.js for the fallback approach.
-    title: document.title || null,
     domMismatch: turns.length === 0 && messageCount > 0 ? messageCount : 0,
     // Claude's own session uuid for this conversation, the join to the
     // names in the sidebar (see readSessionNames in cdp-client.js).
@@ -329,7 +325,6 @@ class SessionWatcher {
     this.picked = null;
     this.lastTurns = [];
     this.lastRunning = null;
-    this.lastTitle = null;
     this.lastSessionUuid = null;
     this.lastResyncAt = 0;
     this.reportedMismatch = false;
@@ -372,7 +367,6 @@ class SessionWatcher {
     if (this.closed) return;
     try {
       const result = await cdp.evaluate(this.client, POLL_EXPR, this.picked.contextId);
-      if (result.title) this.lastTitle = result.title;
       if (result.sessionUuid) this.lastSessionUuid = result.sessionUuid;
       if (result.domMismatch && !this.reportedMismatch) {
         // Once per watcher, not per poll: this fires every 1.5s otherwise.
@@ -629,8 +623,6 @@ class Daemon {
       console.error(`CDP unreachable on port ${CDP_PORT} (${err.message}) — reporting no sessions`);
       return [];
     }
-    // One read of the sidebar for the whole list, not one per session.
-    const names = await cdp.readSessionNames(CDP_PORT);
     const claims = new Map();
     const sessions = [];
     for (const t of targets) {
@@ -639,7 +631,7 @@ class Daemon {
         claims.set(t.sessionId, existing.lastSessionUuid);
         sessions.push({
           sessionId: t.sessionId,
-          title: existing.lastTitle,
+          title: null, // filled in below from whichever naming route worked
           preview: existing.lastTurns.length ? stripTags(existing.lastTurns.join('')).slice(-150) : '',
           running: existing.lastRunning,
         });
@@ -656,15 +648,13 @@ class Daemon {
         const picked = await cdp.pickContentFrame(client, frames);
         let preview = '';
         let running = null;
-        let title = null;
         if (picked) {
           const result = await cdp.evaluate(client, POLL_EXPR, picked.contextId);
           preview = stripTags(result.turns.join('')).slice(-150);
           running = result.running;
-          title = result.title;
           claims.set(t.sessionId, result.sessionUuid);
         }
-        sessions.push({ sessionId: t.sessionId, title, preview, running });
+        sessions.push({ sessionId: t.sessionId, title: null, preview, running });
       } catch (err) {
         sessions.push({ sessionId: t.sessionId, title: null, preview: '', running: null, error: err.message });
       } finally {
@@ -678,8 +668,15 @@ class Daemon {
         }
       }
     }
-    // The conversation's name wins over document.title, which measured
-    // null on every webview here.
+    // Exact first, learned second. Nothing else names a session.
+    // The sidebar only helps if some webview told us which conversation it
+    // holds, and after VS Code restores tabs none of them do. Reading it
+    // anyway costs a CDP connect and an evaluate per listing to build a
+    // table nothing can be looked up in.
+    const names = [...claims.values()].some(Boolean)
+      ? await cdp.readSessionNames(CDP_PORT)
+      : {};
+
     // Learn the one pair the workbench can state without guessing.
     const pair = await cdp.readActiveWebviewTitle(
       CDP_PORT,
@@ -692,7 +689,7 @@ class Daemon {
       // data-initial-session is exact when present, so it wins; the
       // learned label covers sessions VS Code restored, where that
       // attribute is never written.
-      s.title = titles.get(s.sessionId) || this.learnedTitles.get(s.sessionId) || s.title;
+      s.title = titles.get(s.sessionId) || this.learnedTitles.get(s.sessionId) || null;
     }
     // Count what actually shipped, not what the uuid join alone produced.
     const named = sessions.filter((s) => s.title).length;

@@ -737,3 +737,32 @@ test('_listSessions: an ambiguous workbench teaches nothing', async (t) => {
   assert.strictEqual(s.title, null);
   assert.strictEqual(d.learnedTitles.size, 0);
 });
+
+test('_listSessions: no session uuid means the sidebar is not read at all', async (t) => {
+  // resolveTitles can only look a uuid up, so with none reported the
+  // sidebar table is unusable — and reading it costs a CDP connect and an
+  // evaluate per listing. After VS Code restores tabs, that is every
+  // listing.
+  let sidebarReads = 0;
+  const d = listableDaemon(t, { targets: [{ sessionId: 'wv-1', targetId: 'T1', url: 'u' }] });
+  t.mock.method(cdp, 'readSessionNames', async () => {
+    sidebarReads++;
+    return {};
+  });
+  await d._listSessions();
+  assert.strictEqual(sidebarReads, 0);
+});
+
+test('_listSessions: a reported uuid does read the sidebar', async (t) => {
+  let sidebarReads = 0;
+  const d = listableDaemon(t, { targets: [{ sessionId: 'wv-1', targetId: 'T1', url: 'u' }] });
+  t.mock.method(cdp, 'pickContentFrame', async () => ({ contextId: 1 }));
+  t.mock.method(cdp, 'evaluate', async () => ({ turns: [], running: false, sessionUuid: 'u-1' }));
+  t.mock.method(cdp, 'readSessionNames', async () => {
+    sidebarReads++;
+    return { 'u-1': 'EKP-63451' };
+  });
+  const [s] = await d._listSessions();
+  assert.strictEqual(sidebarReads, 1);
+  assert.strictEqual(s.title, 'EKP-63451');
+});
