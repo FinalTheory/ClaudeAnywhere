@@ -215,7 +215,75 @@ async function readSessionNames(port) {
   }
 }
 
+// The workbench's own view of "which conversation is on screen right now".
+//
+// data-initial-session is only written when a webview first mounts with a
+// session to open; VS Code restoring tabs after a restart does not write
+// it, and then nothing inside the webview carries the session id at all.
+// The editor tab still has the label though, so this reads the one pair
+// that can be established without guessing: the selected tab and the
+// visible webview are the same conversation.
+//
+// It refuses to answer unless there is exactly one of each. Split editor
+// groups mean several selected tabs and several visible webviews, and
+// pairing across them is the mislabelling this whole approach exists to
+// avoid — an unnamed session is merely ugly, a misnamed one is wrong.
+//
+// Positional pairing was considered and refuted: measured on a live
+// window the selected tab was first in tab order while its webview was
+// third in overlay order.
+const ACTIVE_PAIR_EXPR = `
+(function () {
+  const selected = [...document.querySelectorAll('.tab[aria-selected="true"]')]
+    .map((t) => (t.getAttribute('aria-label') || t.innerText || '').trim())
+    .filter(Boolean);
+  const visible = [...document.querySelectorAll('[class*="webview-overlay"]')]
+    .filter((o) => o.id && getComputedStyle(o).visibility === 'visible')
+    .map((o) => o.id);
+  return { selected, visible };
+})()
+`;
+
+// The judgment, separated from the CDP plumbing so it can be tested
+// without a browser: exactly one selected tab and exactly one visible
+// webview we track, or nothing.
+function pickUniquePair({ selected, visible }, knownIds) {
+  const tabs = (selected || []).filter(Boolean);
+  const ours = (visible || []).filter((id) => knownIds.includes(id));
+  if (tabs.length !== 1 || ours.length !== 1) return null;
+  return { webviewId: ours[0], title: tabs[0] };
+}
+
+// -> { webviewId, title } for the conversation currently on screen, or
+// null. Never throws; a missing pair costs a nicer label.
+async function readActiveWebviewTitle(port, knownIds) {
+  let client;
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/json/list`);
+    if (!res.ok) return null;
+    const targets = await res.json();
+    const page = targets.find((t) => t.type === 'page');
+    if (!page) return null;
+    client = await connect(page);
+    const frames = await getFrames(client);
+    const picked = await pickContentFrame(client, frames);
+    if (!picked) return null;
+    const seen = await evaluate(client, ACTIVE_PAIR_EXPR, picked.contextId);
+    return pickUniquePair(seen || {}, knownIds);
+  } catch (err) {
+    return null;
+  } finally {
+    try {
+      client && client.ws.close();
+    } catch (e) {
+      // already gone
+    }
+  }
+}
+
 module.exports = {
+  pickUniquePair,
+  readActiveWebviewTitle,
   readSessionNames,
   SESSION_NAMES_EXPR,
   findTarget,

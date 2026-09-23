@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { listClaudeSessions, findTarget } = require('../cdp-client.js');
+const { listClaudeSessions, findTarget, pickUniquePair } = require('../cdp-client.js');
 
 function withFetch(t, payload, { status = 200 } = {}) {
   const calls = [];
@@ -84,4 +84,51 @@ test('findTarget: matches on a url substring', async (t) => {
 test('findTarget: no match names the substring it looked for', async (t) => {
   withFetch(t, [webviewTarget('aaa')]);
   await assert.rejects(() => findTarget(9222, 'nope'), /No target matched "nope"/);
+});
+
+// --- pickUniquePair: one conversation named, or none ----------------------
+// data-initial-session is only written on a webview's first mount, so VS
+// Code restoring tabs leaves nothing in the webview carrying the session
+// id. The tab still has the label, and the selected tab and the visible
+// webview are the same conversation — but only when there is exactly one
+// of each.
+
+const KNOWN = ['wv-1', 'wv-2'];
+
+test('pickUniquePair: one selected tab and one visible webview pair up', () => {
+  assert.deepStrictEqual(
+    pickUniquePair({ selected: ['EKP-63451'], visible: ['wv-1'] }, KNOWN),
+    { webviewId: 'wv-1', title: 'EKP-63451' },
+  );
+});
+
+test('pickUniquePair: split editor groups teach nothing', () => {
+  // Several tabs selected and several webviews visible. Pairing across
+  // them is guessing, and a misnamed session is worse than an unnamed one.
+  assert.strictEqual(
+    pickUniquePair({ selected: ['EKP-1', 'EKP-2'], visible: ['wv-1', 'wv-2'] }, KNOWN),
+    null,
+  );
+});
+
+test('pickUniquePair: two tabs but one webview is still ambiguous', () => {
+  assert.strictEqual(pickUniquePair({ selected: ['a', 'b'], visible: ['wv-1'] }, KNOWN), null);
+});
+
+test('pickUniquePair: two visible webviews but one tab is still ambiguous', () => {
+  assert.strictEqual(pickUniquePair({ selected: ['a'], visible: ['wv-1', 'wv-2'] }, KNOWN), null);
+});
+
+test('pickUniquePair: overlays we do not track are ignored, not counted', () => {
+  // The Claude Code sidebar is a webview overlay too, and a visible one
+  // would otherwise make every observation look ambiguous.
+  assert.deepStrictEqual(
+    pickUniquePair({ selected: ['EKP-63451'], visible: ['sidebar-x', 'wv-1'] }, KNOWN),
+    { webviewId: 'wv-1', title: 'EKP-63451' },
+  );
+});
+
+test('pickUniquePair: nothing on screen is null, not a throw', () => {
+  assert.strictEqual(pickUniquePair({}, KNOWN), null);
+  assert.strictEqual(pickUniquePair({ selected: [], visible: [] }, KNOWN), null);
 });

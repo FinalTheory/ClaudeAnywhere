@@ -86,6 +86,19 @@ notice when it does**. Silent failure is the one to design against.
 - `[class*="turn_"]` has no semantic alternative and is load-bearing, so
   it gets a tell instead: finding message blocks but no turns reports a
   DOM mismatch once per watcher rather than an empty conversation.
+- **`data-initial-session` means what it says.** It is written when a
+  webview first mounts with a session to open, and VS Code restoring tabs
+  after a restart does not write it — measured as 0 of 6 webviews carrying
+  it, in the frame holding 286 transcript messages, so the frame was right
+  and the attribute was simply absent. It is exact when present and worth
+  preferring, but it cannot be the only route to a title. The fallback is
+  the workbench's selected tab paired with the visible webview, learned one
+  conversation at a time.
+- Titles are cosmetic, so the rule there is *never wrong, sometimes
+  missing*: `pickUniquePair` refuses to answer unless exactly one tab is
+  selected and exactly one tracked webview is visible. Split editor groups
+  teach it nothing rather than a guess. One line of diagnostics
+  (`titles: n/m named …`) separates the three ways this can go quiet.
 - A probe that stops matching should report, not return a plausible
   nothing. `running: null` is forwarded so the phone shows Unknown;
   `execCommand` returning false fails the submit instead of acking it.

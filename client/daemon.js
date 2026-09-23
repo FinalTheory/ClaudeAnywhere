@@ -471,6 +471,10 @@ class Daemon {
     // nothing once it is stale, so a socket we have given up on cannot
     // schedule a second reconnect on top of the one already running.
     this.generation = 0;
+    // webview id -> tab label, learned one at a time from whichever
+    // conversation is on screen. Fills in as tabs are switched; lost on
+    // restart, which costs a nicer label and nothing else.
+    this.learnedTitles = new Map();
   }
 
   connect() {
@@ -676,11 +680,22 @@ class Daemon {
     }
     // The conversation's name wins over document.title, which measured
     // null on every webview here.
+    // Learn the one pair the workbench can state without guessing.
+    const pair = await cdp.readActiveWebviewTitle(
+      CDP_PORT,
+      targets.map((t) => t.sessionId)
+    );
+    if (pair) this.learnedTitles.set(pair.webviewId, pair.title);
+
     const titles = resolveTitles(claims, names);
     for (const s of sessions) {
-      s.title = titles.get(s.sessionId) || s.title;
+      // data-initial-session is exact when present, so it wins; the
+      // learned label covers sessions VS Code restored, where that
+      // attribute is never written.
+      s.title = titles.get(s.sessionId) || this.learnedTitles.get(s.sessionId) || s.title;
     }
-    const named = [...titles.values()].filter(Boolean).length;
+    // Count what actually shipped, not what the uuid join alone produced.
+    const named = sessions.filter((s) => s.title).length;
     if (named < sessions.length) {
       // Which of the three links broke is not guessable after the fact:
       // no sidebar rows means the Claude Code panel is closed; no session
@@ -689,7 +704,8 @@ class Daemon {
       const uuids = [...claims.values()].filter(Boolean).length;
       console.error(
         `titles: ${named}/${sessions.length} named ` +
-          `(sidebar rows=${Object.keys(names).length}, webviews with a session uuid=${uuids})`
+          `(sidebar rows=${Object.keys(names).length}, webviews with a session uuid=${uuids}, ` +
+          `learned from tabs=${this.learnedTitles.size})`
       );
     }
     return sessions;

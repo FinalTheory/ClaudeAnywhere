@@ -673,3 +673,67 @@ test('a rejecting message handler is caught instead of crashing the process', as
   await new Promise((r) => setTimeout(r, 20));
   assert.deepStrictEqual(unhandled, [], 'nothing escapes the listener');
 });
+
+// --- learned titles: the fallback for restored webviews -------------------
+// data-initial-session is written only when a webview first mounts with a
+// session to open. VS Code restoring tabs after a restart does not write
+// it, and then nothing in the webview carries the session id — measured
+// live as "titles: 0/6 named (sidebar rows=20, webviews with a session
+// uuid=0)" with the picked frame holding 286 transcript messages, so the
+// frame was right and the attribute was simply gone.
+
+function listableDaemon(t, { targets, names = {}, pair = null }) {
+  t.mock.method(cdp, 'listClaudeSessions', async () => targets);
+  t.mock.method(cdp, 'readSessionNames', async () => names);
+  t.mock.method(cdp, 'readActiveWebviewTitle', async () => pair);
+  t.mock.method(cdp, 'findTarget', async () => ({ webSocketDebuggerUrl: 'ws://x' }));
+  t.mock.method(cdp, 'connect', async () => ({ ws: { close() {} }, send: async () => ({}) }));
+  t.mock.method(cdp, 'getFrames', async () => []);
+  t.mock.method(cdp, 'pickContentFrame', async () => null);
+  return new Daemon();
+}
+
+test('_listSessions: the active tab names its webview when the attribute is gone', async (t) => {
+  const d = listableDaemon(t, {
+    targets: [{ sessionId: 'wv-1', targetId: 'T1', url: 'u' }],
+    pair: { webviewId: 'wv-1', title: 'EKP-63451' },
+  });
+  const [s] = await d._listSessions();
+  assert.strictEqual(s.title, 'EKP-63451');
+});
+
+test('_listSessions: a learned title survives the session leaving the screen', async (t) => {
+  // The whole point of caching it: you switch to another tab and the
+  // first one keeps its name.
+  const d = listableDaemon(t, {
+    targets: [
+      { sessionId: 'wv-1', targetId: 'T1', url: 'u' },
+      { sessionId: 'wv-2', targetId: 'T2', url: 'u' },
+    ],
+    pair: { webviewId: 'wv-1', title: 'EKP-63451' },
+  });
+  await d._listSessions();
+  t.mock.method(cdp, 'readActiveWebviewTitle', async () => ({
+    webviewId: 'wv-2',
+    title: 'EKP-63466',
+  }));
+  const out = await d._listSessions();
+  assert.deepStrictEqual(
+    out.map((s) => s.title),
+    ['EKP-63451', 'EKP-63466'],
+    'both named once each has been on screen',
+  );
+});
+
+test('_listSessions: an ambiguous workbench teaches nothing', async (t) => {
+  // readActiveWebviewTitle returns null with split editor groups, where
+  // several tabs are selected and several webviews visible. Guessing a
+  // pairing there is how a session gets someone else's name.
+  const d = listableDaemon(t, {
+    targets: [{ sessionId: 'wv-1', targetId: 'T1', url: 'u' }],
+    pair: null,
+  });
+  const [s] = await d._listSessions();
+  assert.strictEqual(s.title, null);
+  assert.strictEqual(d.learnedTitles.size, 0);
+});
