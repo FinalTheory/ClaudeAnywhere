@@ -696,7 +696,13 @@ class Daemon {
     }
     // Count what actually shipped, not what the uuid join alone produced.
     const named = sessions.filter((s) => s.title).length;
-    if (named < sessions.length) {
+    // Only when the picture changes. Listing happens on every phone
+    // refresh, and an unconditional line here buries the events worth
+    // reading — subscribes, reconnects, DOM mismatches — under a
+    // heartbeat that says the same thing every few seconds.
+    const shape = `${named}/${sessions.length}/${Object.keys(names).length}/${this.learnedTitles.size}`;
+    if (named < sessions.length && shape !== this.lastTitleShape) {
+      this.lastTitleShape = shape;
       // Which of the three links broke is not guessable after the fact:
       // no sidebar rows means the Claude Code panel is closed; no session
       // uuids means the webviews are not carrying data-initial-session;
