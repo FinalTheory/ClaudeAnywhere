@@ -12,6 +12,9 @@ const sendBtn = sendForm.querySelector('button[type="submit"]');
 
 let currentSessionId = null;
 let ws = null;
+// What's currently in the DOM, in order — the baseline a resync diffs
+// against so it can patch instead of rebuild. See applyResyncWindow.
+let renderedTurns = [];
 // Absolute index (into the server's turns list) of the OLDEST turn
 // currently loaded in the DOM — the cursor for "load more history above".
 let loadedStartIndex = 0;
@@ -82,6 +85,7 @@ function openSession(sessionId) {
   loadedStartIndex = 0;
   hasMore = true;
   transcriptEl.innerHTML = '';
+  renderedTurns = [];
   listEl.style.display = 'none';
   // Must be 'flex', not 'block': #session-detail is styled as a flex column
   // (style.css) so #transcript gets a bounded height and scrolls
@@ -109,31 +113,32 @@ function connectPhoneWs(sessionId, delay) {
   };
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
+    // Capture this BEFORE inserting anything — afterwards the container has
+    // already grown and every position reads as "not at the bottom".
+    const stick = atBottom();
     if (msg.type === 'initial') {
       // msg.turns is an array of complete, independently-valid HTML
       // fragments (one per message) — joining them is always well-formed,
       // unlike the old byte-sliced single-string design.
-      transcriptEl.innerHTML = msg.turns.join('');
-      loadedStartIndex = msg.startIndex;
-      hasMore = msg.startIndex > 0;
+      renderWindow(msg.turns, msg.startIndex);
       setStatus(msg.running);
-      scrollToBottom();
+      scrollToBottom(true);
     } else if (msg.type === 'append') {
       // NOT `+=` — `el.innerHTML += x` is `el.innerHTML = el.innerHTML + x`,
       // which tears down and reparses EVERY existing child, not just adds
       // the new ones. That's the "looks like a refresh, screen flickers"
       // symptom — insertAdjacentHTML only touches the new nodes.
       transcriptEl.insertAdjacentHTML('beforeend', msg.turns.join(''));
-      scrollToBottom();
+      renderedTurns = renderedTurns.concat(msg.turns);
+      applyCollapse();
+      scrollToBottom(stick);
     } else if (msg.type === 'resync') {
       // Server already truncated this to the same tail-window size as
       // `initial` (see server.py) — treat it identically: reset the
       // pagination cursor too, or scrolling up next would fetch history
       // using a cursor computed against content that no longer exists.
-      transcriptEl.innerHTML = msg.turns.join('');
-      loadedStartIndex = msg.startIndex;
-      hasMore = msg.startIndex > 0;
-      scrollToBottom();
+      applyResyncWindow(msg.turns, msg.startIndex);
+      scrollToBottom(stick);
     } else if (msg.type === 'state') {
       setStatus(msg.running);
     } else if (msg.type === 'submit_ack') {
@@ -169,7 +174,134 @@ function setStatus(running, note) {
   sendBtn.classList.toggle('maybe-busy', running === true);
 }
 
-function scrollToBottom() {
+// --- rendering -----------------------------------------------------------
+
+function renderWindow(turns, startIndex) {
+  transcriptEl.innerHTML = turns.join('');
+  renderedTurns = turns.slice();
+  loadedStartIndex = startIndex;
+  hasMore = startIndex > 0;
+  applyCollapse();
+}
+
+// While a response is being written, the daemon sends a `resync` on EVERY
+// poll tick: the final turn's HTML grows in place, which is not a clean
+// append, so diffTurns falls back to resync (see daemon.js). Rebuilding
+// #transcript from innerHTML on each of those tore down and reparsed the
+// whole transcript once every 1.5s. That is what made the composer
+// unusable while output was streaming — a full DOM teardown in the same
+// frame as a programmatic scroll drops the text selection and caret on
+// iOS, so selecting or editing text was impossible until output stopped.
+//
+// The streaming case is narrow and worth special-casing: same window
+// origin, same turn count, only the last turn's HTML differs. Patch that
+// one element and leave the rest of the DOM — and the selection — alone.
+// Anything else (the window slid, turns were spliced, the user has paged
+// older history in) falls back to a full render, which is what a resync
+// means in the general case.
+function applyResyncWindow(turns, startIndex) {
+  const n = transcriptEl.children.length;
+  const sameWindow =
+    startIndex === loadedStartIndex && turns.length === n && n === renderedTurns.length;
+  if (sameWindow && turns.slice(0, -1).every((t, i) => t === renderedTurns[i])) {
+    if (turns[n - 1] !== renderedTurns[n - 1]) {
+      transcriptEl.children[n - 1].outerHTML = turns[n - 1];
+      renderedTurns = turns.slice();
+      applyCollapse();
+    }
+    return;
+  }
+  renderWindow(turns, startIndex);
+}
+
+// Your own messages are capped to --collapsed-max-height and expand on
+// tap. Claude's replies are never capped — re-reading those is the point
+// of the view; your own text you just wrote.
+//
+// The unit is a message block one level inside a turn, NOT the turn
+// itself. A turn is a whole exchange — one captured turn measured 100KB
+// and held the question, the thinking, the reply and eighteen tool calls
+// as sibling children. At turn granularity a question and its answer are
+// the same element, so either both collapse or neither does.
+//
+// `[aria-label="You"]` is what separates them, and it is a sturdier
+// handle than the class prefix: every block carries `message_`, while the
+// reply blocks are labelled "Claude", "Claude, thinking", "Claude, Bash"
+// and so on. aria-label is semantic markup rather than a hashed
+// CSS-module name, so it survives the version churn the class names do
+// not. One sibling carries `userMessageContainer_` with no label at all —
+// a system note, not something you wrote, correctly left alone.
+//
+// The cap itself lives in the stylesheet; nothing here duplicates it.
+const COLLAPSE_UNITS = '#transcript > * > [aria-label="You"]';
+
+function applyCollapse() {
+  const units = transcriptEl.querySelectorAll(COLLAPSE_UNITS);
+  for (let i = 0; i < units.length; i++) {
+    const el = units[i];
+    if (el.dataset.expanded === '1') continue;
+    // Settled already: either capped, or measured once and found to fit.
+    // Without these markers every poll re-measures every block, and each
+    // measurement forces a synchronous layout.
+    if (el.classList.contains('turn-collapsed') || el.dataset.fits === '1') continue;
+    // Measure the height before and after the cap, and keep the cap only
+    // if the element actually got shorter.
+    //
+    // The obvious test — scrollHeight > clientHeight once capped — is
+    // wrong here, and wrong in a way that looks plausible. `overflow:
+    // hidden` establishes a block formatting context, so a child's margin
+    // stops collapsing through the parent and the content box grows by
+    // that margin. scrollHeight then exceeds clientHeight by a few pixels
+    // on nearly every block, including one-line ones, which caps blocks
+    // that need no capping.
+    const natural = el.offsetHeight;
+    el.classList.add('turn-collapsed');
+    if (el.offsetHeight >= natural) {
+      el.classList.remove('turn-collapsed');
+      el.dataset.fits = '1';
+    }
+  }
+}
+
+transcriptEl.addEventListener('click', (e) => {
+  // A tap that finished a text selection is not a toggle request — without
+  // this, selecting anything inside an expanded block collapses it out
+  // from under the selection.
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed) return;
+
+  const unit = e.target.closest(COLLAPSE_UNITS);
+  if (!unit) return;
+  if (unit.classList.contains('turn-collapsed')) {
+    unit.classList.remove('turn-collapsed');
+    unit.dataset.expanded = '1'; // survives applyCollapse on the next poll
+  } else if (unit.dataset.expanded === '1') {
+    // Only re-collapses something the user opened by hand. A block that
+    // fits on its own, or the live tail that is deliberately kept open,
+    // carries no `expanded` marker and so cannot be collapsed by a stray
+    // tap.
+    delete unit.dataset.expanded;
+    unit.classList.add('turn-collapsed');
+  }
+});
+
+// --- scrolling -----------------------------------------------------------
+
+const AUTOSCROLL_SLACK_PX = 80;
+
+function atBottom() {
+  return (
+    transcriptEl.scrollHeight - transcriptEl.scrollTop - transcriptEl.clientHeight <
+    AUTOSCROLL_SLACK_PX
+  );
+}
+
+// Only follow new output when the view was already parked at the bottom.
+// Scrolling unconditionally yanked the viewport away mid-read whenever a
+// poll landed, and each programmatic scroll is another chance to drop a
+// selection on iOS.
+function scrollToBottom(force) {
+  if (!force) return;
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
@@ -196,6 +328,8 @@ transcriptEl.addEventListener('scroll', async () => {
     }
     const prevHeight = transcriptEl.scrollHeight;
     transcriptEl.insertAdjacentHTML('afterbegin', data.turns.join(''));
+    renderedTurns = data.turns.concat(renderedTurns);
+    applyCollapse();
     loadedStartIndex = data.start_index;
     hasMore = data.has_more;
     transcriptEl.scrollTop = transcriptEl.scrollHeight - prevHeight;

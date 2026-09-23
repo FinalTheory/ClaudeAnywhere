@@ -26,6 +26,16 @@
      below (search this file for --app-line-height to find that rule if you
      ever need to move it). */
   --app-line-height: 1.6;
+  /* THE composer size knob, deliberately independent of --app-font-scale:
+     the input costs screen area the transcript needs more. 16px is the
+     floor — below it iOS Safari zooms the whole page on focus and you have
+     to pinch back out every time. */
+  --app-input-font-size: 16px;
+  /* THE collapse knob. Your own messages are capped at this height and
+     expand on tap (app.js picks them out by aria-label); one shorter than
+     this is left alone entirely, and Claude's replies are never capped.
+     Raise it to see more of each message, lower it to scroll less. */
+  --collapsed-max-height: 12vh;
 }
 
 /* claude-webview.css sets html/body to display:flex (row) for its own
@@ -188,10 +198,7 @@ body > #session-detail {
   border: 1px solid var(--vscode-input-border, #444);
   background: var(--vscode-input-background, #2a2a2a);
   color: var(--vscode-input-foreground, #eee);
-  /* 16px+ avoids iOS Safari auto-zooming the page on focus — calc() here
-     only ever scales this UP from 16px (--app-font-scale defaults to 1.5,
-     and isn't meant to go below 1), so that stays true regardless. */
-  font-size: calc(16px * var(--app-font-scale));
+  font-size: var(--app-input-font-size);
   font-family: inherit;
   /* textarea, not input — multi-line composition is the point. Auto-grows
      via JS (app.js) up to this height, then scrolls internally instead of
@@ -250,6 +257,25 @@ body > #session-detail {
   display: none !important;
 }
 
+/* Monaco's own editor chrome, captured inside tool-output code blocks:
+   minimap, overview ruler, scrollbars and their sliders. Dead weight for
+   the same reason the buttons above are — we inject static HTML and never
+   load Monaco, so nothing drives them. They are not merely invisible
+   though: the sliders are absolutely positioned with inline offsets
+   computed for the desktop panel width, so on a phone they land wherever
+   the narrower layout puts them and render as stray grey bars over the
+   text. */
+#transcript .minimap,
+#transcript .minimap-slider,
+#transcript .minimap-slider-horizontal,
+#transcript .minimap-shadow-hidden,
+#transcript .minimap-shadow-visible,
+#transcript .decorationsOverviewRuler,
+#transcript .scrollbar,
+#transcript .slider {
+  display: none !important;
+}
+
 /* Screen-reader-only content — invisible by design, just making sure this
    holds without Claude's own stylesheet doing the a11y-hiding trick itself
    (it should already, via claude-webview.css, but belt and suspenders). */
@@ -271,6 +297,45 @@ body > #session-detail {
 #transcript [class*="metaMessage_"] {
   line-height: var(--app-line-height);
 }
+
+/* Your own messages collapse to --collapsed-max-height and expand on tap;
+   app.js picks them out by aria-label and only caps one that genuinely
+   overflows. Claude's replies are never capped. The unit is a message
+   block inside a turn, not the turn itself — a turn is a whole exchange,
+   so capping at that level cannot separate a question from its answer.
+   The class is `turn-collapsed`, not `collapsed`, so it cannot be caught
+   by the [class*="collapsed_"] rule above that force-expands Claude's own
+   collapsed sections — an element carrying both would fight itself. */
+#transcript .turn-collapsed {
+  max-height: var(--collapsed-max-height);
+  overflow: hidden;
+  position: relative;
+  cursor: pointer;
+}
+/* An overlay rather than a mask-image on the element itself: a mask fades
+   out everything inside the box, including anything layered over the
+   truncation point. */
+#transcript .turn-collapsed::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  /* Deliberately short: the fade sits inside --collapsed-max-height, so a
+     tall gradient eats most of the preview it is meant to be softening. */
+  height: 2em;
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    var(--vscode-editor-background, #1e1e1e) 85%
+  );
+  pointer-events: none;
+}
+/* The fade is the whole affordance. A floating chevron chip was tried and
+   removed: one per capped block, and with several capped blocks on screen
+   they stacked into a grey column running down the middle of the
+   transcript. The gradient already reads as "there is more here", and it
+   cannot accumulate into anything. */
 
 /* Prevent horizontal overflow — the single biggest mobile-layout risk from
    long code lines / tool output. */
