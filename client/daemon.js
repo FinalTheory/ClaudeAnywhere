@@ -680,6 +680,18 @@ class Daemon {
     for (const s of sessions) {
       s.title = titles.get(s.sessionId) || s.title;
     }
+    const named = [...titles.values()].filter(Boolean).length;
+    if (named < sessions.length) {
+      // Which of the three links broke is not guessable after the fact:
+      // no sidebar rows means the Claude Code panel is closed; no session
+      // uuids means the webviews are not carrying data-initial-session;
+      // both present with nothing named means the two id sets disagree.
+      const uuids = [...claims.values()].filter(Boolean).length;
+      console.error(
+        `titles: ${named}/${sessions.length} named ` +
+          `(sidebar rows=${Object.keys(names).length}, webviews with a session uuid=${uuids})`
+      );
+    }
     return sessions;
   }
 }
