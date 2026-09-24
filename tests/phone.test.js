@@ -98,6 +98,7 @@ function loadPhone(epilogue = '') {
     return el;
   };
   const cache = new Map();
+  const ticks = [];
   let lastWs = null;
   const sandbox = {
     document: {
@@ -125,7 +126,13 @@ function loadPhone(epilogue = '') {
       { OPEN: 1 }
     ),
     fetch: async () => ({ ok: true, redirected: false, status: 200, json: async () => ({ sessions: [] }) }),
-    setInterval: () => 0,
+    // Captured rather than stubbed dead. The liveness loop is what keeps
+    // the phone attached across a suspended tab, and `() => 0` made every
+    // assertion about it impossible.
+    setInterval: (fn) => {
+      ticks.push(fn);
+      return ticks.length;
+    },
     setTimeout,
     clearTimeout,
     Event: function () {},
@@ -138,7 +145,7 @@ function loadPhone(epilogue = '') {
   const names = Object.keys(sandbox);
   const fn = new Function(...names, `${src}\n${epilogue}`);
   const out = fn(...names.map((n) => sandbox[n]));
-  return { missing, out };
+  return { missing, out, tick: () => ticks.forEach((f) => f()) };
 }
 
 test('phone: it evaluates, and every element it reaches for is in index.html', () => {
@@ -448,4 +455,32 @@ test('phone: a failure ack does not clobber a message already being composed', (
     return { composer: promptInput.value };
   `);
   assert.strictEqual(out.composer, 'something new', 'the restore only fills an empty box');
+});
+
+test('phone: the liveness loop pings a quiet socket and redials a dead one', () => {
+  // Stubbing setInterval dead made this untestable, and it is what keeps
+  // the phone attached across a suspended tab: the browser answers
+  // protocol-level pings below the WebSocket API, so an application ping
+  // is the only observable.
+  const quiet = loadPhone(`
+    openSession('A', 'alpha');
+    lastInboundAt = Date.now() - 25000;   // past PING_EVERY_MS, short of DEAD
+    ws.sent = [];
+    ws.send = (d) => ws.sent.push(d);
+    return { before: ws, sentAt: () => ws.sent };
+  `);
+  quiet.tick();
+  assert.deepStrictEqual(
+    quiet.out.sentAt().map((d) => JSON.parse(d).type),
+    ['ping'],
+    'a quiet but open socket is pinged, not abandoned'
+  );
+
+  const dead = loadPhone(`
+    openSession('A', 'alpha');
+    lastInboundAt = Date.now() - 120000;  // past DEAD_AFTER_MS
+    return { before: ws, now: () => ws };
+  `);
+  dead.tick();
+  assert.notStrictEqual(dead.out.now(), dead.out.before, 'silence past the deadline redials');
 });
