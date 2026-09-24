@@ -22,8 +22,37 @@ async function connect(target) {
     ws.addEventListener('open', () => resolve());
     ws.addEventListener('error', (ev) => reject(new Error('WebSocket connect failed')));
   });
+  return { ws, send: await enableRuntime(makeSend(ws)) };
+}
 
+// Separate from connect() so the settle-on-close behaviour below can be
+// exercised without standing up a WebSocket server in a suite that has no
+// dependencies to do it with.
+function makeSend(ws) {
   let nextId = 1;
+  // Every request in flight, so the socket dying can settle them. A reply
+  // is the only thing that resolved a send, and a debug socket that goes
+  // away mid-request — VS Code quitting, the window closing, the port
+  // being restarted — produces no reply and no rejection, so the await
+  // never returns. Nothing downstream is built to survive that: the poll
+  // loop reschedules in a `finally`-shaped tail it never reaches, so the
+  // phone's live view freezes with no error, and re-subscribing is a
+  // no-op because the wedged watcher is still registered. A session held
+  // by SessionQueue.runLong stays busy for the life of the daemon for the
+  // same reason. Rejecting turns all of that into the reattach path that
+  // already exists.
+  const pending = new Map();
+  const failAll = (reason) => {
+    const err = new Error(reason);
+    for (const [, entry] of pending) {
+      ws.removeEventListener('message', entry.onMessage);
+      entry.reject(err);
+    }
+    pending.clear();
+  };
+  ws.addEventListener('close', () => failAll('CDP socket closed with requests in flight'));
+  ws.addEventListener('error', () => failAll('CDP socket errored with requests in flight'));
+
   function send(method, params = {}) {
     const id = nextId++;
     return new Promise((resolve, reject) => {
@@ -31,16 +60,30 @@ async function connect(target) {
         const msg = JSON.parse(ev.data);
         if (msg.id !== id) return;
         ws.removeEventListener('message', onMessage);
+        pending.delete(id);
         if (msg.error) reject(new Error(msg.error.message));
         else resolve(msg.result);
       };
+      pending.set(id, { reject, onMessage });
       ws.addEventListener('message', onMessage);
-      ws.send(JSON.stringify({ id, method, params }));
+      try {
+        ws.send(JSON.stringify({ id, method, params }));
+      } catch (err) {
+        // A send on an already-closed socket throws synchronously, before
+        // any close event this listener would see.
+        ws.removeEventListener('message', onMessage);
+        pending.delete(id);
+        reject(err);
+      }
     });
   }
 
+  return send;
+}
+
+async function enableRuntime(send) {
   await send('Runtime.enable');
-  return { ws, send };
+  return send;
 }
 
 async function evaluate(client, expression, contextId) {
@@ -295,6 +338,7 @@ module.exports = {
   readSessionNames,
   findTarget,
   connect,
+  makeSend,
   evaluate,
   getFrames,
   isolatedWorldContext,

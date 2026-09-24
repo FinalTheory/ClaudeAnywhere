@@ -1089,7 +1089,7 @@ test('clickReconnectFor: the hop cap is not a containment proof', () => {
   };
   const out = runExpr(clickReconnectFor('jira-ghe'), doc);
   assert.strictEqual(out.ok, false);
-  assert.match(out.reason, /not the actions it belongs to/);
+  assert.match(out.reason, /gave up 8 levels above the title/);
   assert.strictEqual(btn.clicked, 0);
 });
 
@@ -1773,35 +1773,69 @@ test('newSession: exactly one new conversation is used', async (t) => {
 // then a command menu once /mcp is typed, then a list once the entry is
 // clicked. A fake that reports the panel already open would take the
 // early return and prove nothing.
-function fakeMcpRun({ draft = '', clearFails = false, restoreFails = false, injectIgnored = false, rowClickFails = false }) {
+function fakeMcpRun({
+  draft = '',
+  clearFails = false,
+  restoreFails = false,
+  injectIgnored = false,
+  rowClickFails = false,
+  servers = [],
+  reconnectPolls = 2,
+}) {
   let opened = false;
   // The composer is modelled, not scripted. Scripting each call's answer
   // means a test can assert "the restore reported ok" while the modelled
   // editor holds "/mcphello" — the defect the restore path exists to
   // prevent — and stay green. clearFails: 'restore' fails only the
-  // cleanup clear, since a failing first clear aborts before anything
-  // has been typed and never reaches the interesting path.
+  // cleanup clear, since a failing first clear aborts before anything has
+  // been typed and never reaches the interesting path.
   let composer = draft;
   // Distinct from `opened`, which gates the command menu: the panel is
   // opened once and closed again on the way out, and a fake that never
   // closes spends the close timeout on every call.
   let panelOpen = false;
+  let detail = null;
+  let busyLeft = 0;
+  // Every expression has to be told apart by something it alone contains,
+  // and the obvious substrings overlap: MCP_STATE and RECONNECT_BUSY both
+  // mention statusBadge_, MCP_STATE and clickServerRow both mention
+  // serverItem_. Matching on the wrong one silently answers the wrong
+  // question — an earlier version of this fake made clickServerRow
+  // unreachable that way, and the test that depended on it asserted
+  // against the string "undefined" without noticing.
   return async (expr) => {
     if (expr.includes('commandItem_') && expr.includes('draft')) {
       return { items: opened ? [] : ['/mcp'], draft: composer, structured: false };
     }
+    if (expr.includes('detailActions_')) {
+      if (!detail) return { ok: false, reason: 'no detail view' };
+      busyLeft = reconnectPolls;
+      return { ok: true };
+    }
+    if (expr.includes('actionButton_')) {
+      const busy = busyLeft > 0;
+      if (busy) busyLeft -= 1;
+      const row = servers.find((r) => r.name === detail);
+      return { busy, title: detail, status: row ? row.status : null };
+    }
+    if (expr.includes('serverItem_') && expr.includes('.click()')) {
+      if (rowClickFails || !servers.some((r) => r.name === expr.match(/wanted = "([^"]*)"/)[1])) {
+        return { ok: false, reason: 'no server called that', seen: servers.map((r) => r.name) };
+      }
+      detail = expr.match(/wanted = "([^"]*)"/)[1];
+      return { ok: true };
+    }
     if (expr.includes('serverItem_')) {
-      return panelOpen
-        ? { panel: 'list', title: null, rows: [], menuOpen: false }
-        : { panel: 'none', title: null, rows: [], menuOpen: false };
+      if (!panelOpen) return { panel: 'none', title: null, rows: [], menuOpen: false };
+      if (detail) {
+        const row = servers.find((r) => r.name === detail);
+        return { panel: 'detail', title: detail, status: row ? row.status : null, rows: [], menuOpen: false };
+      }
+      return { panel: 'list', title: null, rows: servers, menuOpen: false };
     }
     if (expr.includes('iconButton_') || expr.includes("'close'")) {
       panelOpen = false;
       return { ok: true };
-    }
-    // After the MCP_STATE branch above, which also mentions serverName_.
-    if (rowClickFails && expr.includes('serverName_')) {
-      return { ok: false, reason: 'no server called that', seen: ['github'] };
     }
     if (expr.includes('commandLabel_')) {
       opened = true;
@@ -1888,6 +1922,63 @@ test('readMcpServers and reconnectMcpServer carry the note out to the phone', as
   );
   assert.strictEqual(recon.ok, false);
   assert.match(recon.note, /may be left in the laptop composer/);
+  // Named, because a fake branch the expression never reaches answers
+  // the wrong question and the assertion above still passes: this test
+  // read the literal string "undefined" as its error once.
+  assert.match(recon.error, /no server called that/);
+});
+
+test('reconnectMcpServer: the whole path, from the list to a settled reconnect', async () => {
+  // The only end-to-end cover for the path that actually clicks Reconnect
+  // on the laptop. Everything else exercises a refusal.
+  const run = fakeMcpRun({ servers: [{ name: 'github', status: 'Connected' }] });
+  const out = await reconnectMcpServer(run, 'github');
+  assert.strictEqual(out.ok, true);
+  assert.match(out.status, /^reconnected/);
+  assert.strictEqual(out.note, undefined, 'a clean run carries nothing to report');
+});
+
+test('reconnectMcpServer: a reconnect that never starts says so rather than claiming success', async () => {
+  // busy is never observed, so the click cannot be confirmed to have done
+  // anything. Saying "reconnected" here is the lie this guards.
+  const run = fakeMcpRun({ servers: [{ name: 'github', status: 'Connected' }], reconnectPolls: 0 });
+  const out = await reconnectMcpServer(run, 'github');
+  assert.strictEqual(out.ok, true);
+  assert.match(out.status, /never saw it start/);
+});
+
+test('reconnectMcpServer: an unknown name lists the ones that are there', async () => {
+  const run = fakeMcpRun({ servers: [{ name: 'github', status: 'Connected' }] });
+  const out = await reconnectMcpServer(run, 'jira-ghe');
+  assert.strictEqual(out.ok, false);
+  assert.match(out.error, /github/);
+});
+
+test('openMcpPanel: the note survives the panel failing to open', async () => {
+  // The exit that drops it is the one where the author most needs it:
+  // nothing opened, so nothing else explains why their next message goes
+  // out as "/mcp…". submit() inserts at the caret without clearing.
+  const run = fakeMcpRun({ draft: '', clearFails: true });
+  const orig = run;
+  // The command menu is clicked, so cleanup runs, but the panel never
+  // mounts.
+  const out = await openMcpPanel(async (expr) =>
+    expr.includes('serverItem_') && !expr.includes('.click()')
+      ? { panel: 'none', title: null, rows: [], menuOpen: false }
+      : orig(expr)
+  );
+  assert.strictEqual(out.ok, false);
+  assert.match(out.error, /did not open/);
+  assert.match(out.note, /may be left in the laptop composer/);
+});
+
+test('readMcpServers: the rows reach the phone', async () => {
+  const run = fakeMcpRun({
+    servers: [{ name: 'github', status: 'Connected' }, { name: 'jira-ghe', status: 'Failed' }],
+  });
+  const out = await readMcpServers(run);
+  assert.strictEqual(out.ok, true);
+  assert.deepStrictEqual(out.servers.map((r) => r.name), ['github', 'jira-ghe']);
 });
 
 test('openMcpPanel: a clean run carries no note', async () => {

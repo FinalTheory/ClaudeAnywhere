@@ -224,7 +224,9 @@ function renderMcp(out) {
           mcpListEl.hidden = false;
           refreshMcp();
         } else {
-          status.textContent = res.error || 'failed';
+          // The note carries out of the failure exits too, and it is a
+          // separate thing to deal with from whatever failed.
+          status.textContent = [res.error || 'failed', res.note].filter(Boolean).join(' · ');
           status.className = 'mcp-status bad';
         }
       } catch (err) {

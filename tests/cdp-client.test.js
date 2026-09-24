@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { listClaudeSessions, findTarget, pickUniquePair } = require('../cdp-client.js');
+const { listClaudeSessions, findTarget, pickUniquePair, makeSend } = require('../cdp-client.js');
 
 function withFetch(t, payload, { status = 200 } = {}) {
   const calls = [];
@@ -131,4 +131,80 @@ test('pickUniquePair: overlays we do not track are ignored, not counted', () => 
 test('pickUniquePair: nothing on screen is null, not a throw', () => {
   assert.strictEqual(pickUniquePair({}, KNOWN), null);
   assert.strictEqual(pickUniquePair({ selected: [], visible: [] }, KNOWN), null);
+});
+
+// --- a request in flight when the debug socket dies ----------------------
+
+function fakeSocket() {
+  const listeners = new Map();
+  return {
+    sent: [],
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      const set = listeners.get(type);
+      if (set) set.delete(fn);
+    },
+    send(data) {
+      this.sent.push(data);
+    },
+    fire(type, ev) {
+      for (const fn of [...(listeners.get(type) || [])]) fn(ev);
+    },
+    count(type) {
+      return (listeners.get(type) || new Set()).size;
+    },
+  };
+}
+
+test('send: a request outstanding when the socket closes is rejected, not abandoned', async () => {
+  // A reply is the only thing that used to settle a send. VS Code quitting
+  // mid-poll produces no reply and no rejection, so the await never
+  // returns — and nothing downstream survives that. SessionWatcher._tick
+  // reschedules after its own catch, which it never reaches, so the
+  // phone's live view freezes with no error and re-subscribing is a no-op
+  // because the wedged watcher is still registered. A session held by
+  // SessionQueue.runLong stays busy for the life of the daemon.
+  const ws = fakeSocket();
+  const send = makeSend(ws);
+  const pending = send('Runtime.evaluate', { expression: '1' });
+  ws.fire('close', {});
+  await assert.rejects(pending, /socket closed with requests in flight/);
+});
+
+test('send: an errored socket settles everything in flight', async () => {
+  const ws = fakeSocket();
+  const send = makeSend(ws);
+  const a = send('A');
+  const b = send('B');
+  ws.fire('error', {});
+  await assert.rejects(a, /errored with requests in flight/);
+  await assert.rejects(b, /errored with requests in flight/);
+});
+
+test('send: a reply still resolves, and leaves no listener behind', async () => {
+  const ws = fakeSocket();
+  const send = makeSend(ws);
+  const before = ws.count('message');
+  const p = send('Runtime.evaluate', { expression: '1' });
+  const { id } = JSON.parse(ws.sent[0]);
+  ws.fire('message', { data: JSON.stringify({ id, result: { value: 7 } }) });
+  assert.deepStrictEqual(await p, { value: 7 });
+  // A per-request listener that outlives its reply accumulates one entry
+  // per poll, forever, on a socket that polls every 1.5s.
+  assert.strictEqual(ws.count('message'), before);
+});
+
+test('send: sending on an already-dead socket rejects instead of hanging', async () => {
+  // The throw is synchronous and lands before any close event a listener
+  // would see.
+  const ws = fakeSocket();
+  const send = makeSend(ws);
+  ws.send = () => {
+    throw new Error('WebSocket is not open');
+  };
+  await assert.rejects(send('Runtime.evaluate', {}), /not open/);
+  assert.strictEqual(ws.count('message'), 0, 'and does not leak its listener');
 });

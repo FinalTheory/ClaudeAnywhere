@@ -318,8 +318,17 @@ function clickReconnectFor(name) {
   // The loop also exits on the hop cap, with panel non-null and nothing
   // proved. Re-assert containment rather than inferring it from the walk
   // having stopped.
-  if (!panel || !panel.contains(actions)) {
-    return { ok: false, reason: 'found the title but not the actions it belongs to' };
+  if (!panel) return { ok: false, reason: 'found the title but not the actions it belongs to' };
+  // Told apart from the case above on purpose. With containment now
+  // required, a cap set below the panel's real nesting depth refuses every
+  // reconnect, and the two refusals have entirely different fixes — this
+  // one is the number on the line above. The depth cannot be measured
+  // without the live panel, so name the cap rather than guess past it.
+  if (!panel.contains(actions)) {
+    return {
+      ok: false,
+      reason: 'gave up ' + hops + ' levels above the title without reaching the actions it belongs to',
+    };
   }
 
   const btns = [...actions.querySelectorAll('[class*="actionButton_"]')]
@@ -881,12 +890,16 @@ async function openMcpPanel(run) {
     // Any throw in here leaves "/mcp" sitting in someone's composer
     // unless the restore runs. That is the whole reason for the finally
     // shape rather than a cleanup call on each exit.
-    await restore();
+    const lost = await restore();
+    if (lost) err.message = `${err.message}; ${lost}`;
     throw err;
   }
 
   state = await waitFor(run, MCP_STATE_EXPR, (st) => st.panel !== 'none');
-  if (state.panel === 'none') return { ok: false, error: 'the MCP panel did not open' };
+  // The note rides the failure too. submit() inserts at the caret without
+  // clearing first, so a "/mcp" nobody was told about goes out in front of
+  // the author's next message.
+  if (state.panel === 'none') return { ok: false, error: 'the MCP panel did not open', note };
   return { ok: true, state, note };
 }
 
