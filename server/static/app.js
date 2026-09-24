@@ -203,6 +203,15 @@ function renderMcp(out) {
       try {
         const res = await postJson('/api/mcp/reconnect', { serverName: srv.name });
         if (res.ok) {
+          // ok does not always mean confirmed. The daemon returns a
+          // status sentence when it clicked but never saw the reconnect
+          // start, and refreshing straight past it would present a
+          // guess as a result.
+          if (res.status && !/^reconnected/.test(res.status)) {
+            status.textContent = res.status;
+            status.className = 'mcp-status bad';
+            return;
+          }
           mcpListEl.hidden = false;
           refreshMcp();
         } else {

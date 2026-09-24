@@ -9,6 +9,7 @@ const assert = require('node:assert');
 
 const cdp = require('../cdp-client.js');
 const {
+  openMcpPanel,
   SessionQueue,
   CLEAR_COMPOSER_EXPR,
   MENU_STATE_EXPR,
@@ -947,8 +948,16 @@ function fakeDom(nodes) {
       if (name === 'title') return n.title || null;
       return null;
     },
+    // A flat bag has no real containment; every element "contains" the
+    // whole bag so the flat tests keep working, and the cases that turn
+    // on containment build their own DOM below.
+    contains: () => true,
     click() {
       this.clicked++;
+    },
+    querySelectorAll(sel) {
+      const want = sel.match(/class\*="([^"]+)"/)[1];
+      return els.filter((e) => e.className.includes(want));
     },
     querySelector(sel) {
       const want = sel.match(/class\*="([^"]+)"/)[1];
@@ -967,6 +976,7 @@ function fakeDom(nodes) {
   const root = {
     className: 'root',
     parentElement: null,
+    contains: () => true,
     querySelectorAll: (sel) => find(sel),
     querySelector: (sel) => find(sel)[0] || null,
   };
@@ -1285,22 +1295,25 @@ test('clickReconnectFor: refuses when the title has no actions around it', () =>
   assert.strictEqual(dom.els[1].clicked, 0);
 });
 
-test('CLEAR_COMPOSER_EXPR: a refused edit is reported, not assumed', () => {
-  const box = { value: 'draft', focus() {}, innerHTML: 'draft' };
-  const doc = {
-    querySelectorAll: () => [box],
-    execCommand: (cmd) => cmd !== 'delete', // delete refused
+test('CLEAR_COMPOSER_EXPR: judges the composer, not execCommand\'s answer', () => {
+  // This editor returns false from selectAll and performs it anyway.
+  // Trusting the return value made every MCP action fail with
+  // "selectAll refused" on a flow that had been working, so what is left
+  // in the composer is the only thing consulted.
+  const cleared = { value: 'draft', focus() {}, innerHTML: 'draft' };
+  const lying = {
+    querySelectorAll: () => [cleared],
+    execCommand: (cmd) => {
+      if (cmd === 'delete') cleared.value = '';
+      return false; // refuses on paper, works in fact
+    },
   };
-  const out = runExpr(CLEAR_COMPOSER_EXPR, doc);
-  assert.strictEqual(out.ok, false);
-  assert.match(out.reason, /delete refused/);
-});
+  assert.strictEqual(runExpr(CLEAR_COMPOSER_EXPR, lying).ok, true);
 
-test('CLEAR_COMPOSER_EXPR: text surviving the clear is a failure', () => {
-  const box = { value: 'still here', focus() {}, innerHTML: '' };
-  const doc = { querySelectorAll: () => [box], execCommand: () => true };
-  const out = runExpr(CLEAR_COMPOSER_EXPR, doc);
-  assert.strictEqual(out.ok, false);
+  const stuck = { value: 'still here', focus() {}, innerHTML: '' };
+  const useless = { querySelectorAll: () => [stuck], execCommand: () => true };
+  const out = runExpr(CLEAR_COMPOSER_EXPR, useless);
+  assert.strictEqual(out.ok, false, 'text left behind is the failure, whatever was returned');
   assert.match(out.reason, /still holds text/);
 });
 
@@ -1427,15 +1440,26 @@ test('clickReconnectFor: a Reconnect button outside the verified panel is not cl
   // inside the panel that owns the verified title.
   const outside = { className: 'actionButton_IHCQeQ', textContent: 'Reconnect', disabled: false, clicked: 0, click() { this.clicked++; }, getAttribute: () => null };
   const inside = { className: 'actionButton_IHCQeQ', textContent: 'Reconnect', disabled: false, clicked: 0, click() { this.clicked++; }, getAttribute: () => null };
-  const actions = { className: 'detailActions_IHCQeQ', textContent: '', getAttribute: () => null };
   const sel = (nodes) => (s) => {
     const want = s.match(/class\*="([^"]+)"/)[1];
     return nodes.filter((n) => n.className.includes(want));
+  };
+  // The actions row holds only the button that belongs to it — which is
+  // the whole point: a flat fake cannot tell a scoped query from a
+  // document-wide one, so a passing scope test would mean nothing.
+  const actions = {
+    className: 'detailActions_IHCQeQ',
+    textContent: '',
+    getAttribute: () => null,
+    contains: (x) => x === inside,
+    querySelectorAll: (s) => sel([inside])(s),
+    querySelector: (s) => sel([inside])(s)[0] || null,
   };
   const panelNodes = [actions, inside];
   const panel = {
     className: 'detailPanel_IHCQeQ',
     parentElement: null,
+    contains: (x) => panelNodes.includes(x),
     querySelectorAll: (s) => sel(panelNodes)(s),
     querySelector: (s) => sel(panelNodes)(s)[0] || null,
   };
@@ -1444,7 +1468,7 @@ test('clickReconnectFor: a Reconnect button outside the verified panel is not cl
     textContent: 'jira-ghe',
     parentElement: panel,
     getAttribute: () => null,
-    // the title itself contains no actions, so the walk moves up to panel
+    contains: (x) => x === title,
     querySelector: () => null,
     querySelectorAll: () => [],
   };
@@ -1457,4 +1481,199 @@ test('clickReconnectFor: a Reconnect button outside the verified panel is not cl
   assert.strictEqual(out.ok, true);
   assert.strictEqual(inside.clicked, 1, 'the one inside the verified panel');
   assert.strictEqual(outside.clicked, 0, 'and nothing else');
+});
+
+// --- round 9: the fixes that were not complete ---------------------------
+
+test('SessionQueue: a long action marks the session busy, a short one does not', async () => {
+  const q = new SessionQueue();
+  let observedDuringLong = null;
+  const long = q.runLong('s', async () => {
+    observedDuringLong = q.isBusy('s');
+    await new Promise((r) => setTimeout(r, 20));
+  });
+  await long;
+  assert.strictEqual(observedDuringLong, true);
+  assert.strictEqual(q.isBusy('s'), false, 'cleared when it finishes');
+
+  await q.run('s2', async () => {
+    assert.strictEqual(q.isBusy('s2'), false, 'an ordinary submit is not "busy"');
+  });
+});
+
+test('SessionQueue: busy clears even when the long action throws', async () => {
+  const q = new SessionQueue();
+  await assert.rejects(() => q.runLong('s', async () => { throw new Error('boom'); }));
+  assert.strictEqual(q.isBusy('s'), false);
+});
+
+test('MCP_STATE_EXPR: an open list with no servers is a list, not "no panel"', () => {
+  // Using row count as the marker made an empty panel indistinguishable
+  // from no panel, so opening one timed out and the phone was told it
+  // failed to open instead of being shown its own empty state.
+  const dom = fakeDom([{ cls: 'serverList_IHCQeQ', text: '' }]);
+  const out = runExpr(MCP_STATE_EXPR, dom);
+  assert.strictEqual(out.panel, 'list');
+  assert.deepStrictEqual(out.rows, []);
+});
+
+test('MCP_STATE_EXPR: still "none" when nothing of the panel is present', () => {
+  assert.strictEqual(runExpr(MCP_STATE_EXPR, fakeDom([])).panel, 'none');
+});
+
+test('clickReconnectFor: refuses a second action row even with one title', () => {
+  // The shared-ancestor case, with only one title in the document so the
+  // earlier multiple-titles check cannot catch it. The first version of
+  // this test refused for that wrong reason and so proved nothing: the
+  // walk would have reached a root holding a sibling panel's button.
+  const mkEl = (className, textContent) => ({
+    className,
+    textContent,
+    disabled: false,
+    clicked: 0,
+    click() { this.clicked++; },
+    getAttribute: () => null,
+    contains: () => false,
+    querySelectorAll: () => [],
+    querySelector: () => null,
+  });
+  const title = mkEl('detailTitle_IHCQeQ', 'jira-ghe');
+  const mine = mkEl('detailActions_IHCQeQ', '');
+  const sibling = mkEl('detailActions_IHCQeQ', '');
+  const btn = mkEl('actionButton_IHCQeQ', 'Reconnect');
+  const all = [title, mine, sibling, btn];
+  const sel = (s) => {
+    const want = s.match(/class\*="([^"]+)"/)[1];
+    return all.filter((n) => n.className.includes(want));
+  };
+  const doc = { querySelectorAll: sel, querySelector: (s) => sel(s)[0] || null };
+  const out = runExpr(clickReconnectFor('jira-ghe'), doc);
+  assert.strictEqual(out.ok, false);
+  assert.match(out.reason, /more than one detail action row/);
+  assert.strictEqual(btn.clicked, 0);
+});
+
+test('submit is refused rather than queued behind a long action', async (t) => {
+  // A reconnect can hold the session for 24s; the phone gives a submit 5s
+  // before telling the author it may not have sent and handing the text
+  // back. Queueing means the daemon types it long after the phone
+  // disowned it, so the author has the text back and it was also sent.
+  const sockets = withFakeSockets(t);
+  const d = new Daemon();
+  d.connect();
+  sockets[0].emit('open');
+  const sent = [];
+  d._send = (m) => sent.push(m);
+
+  // A bounded hold, not an open one: with the guard removed the submit
+  // must fail an assertion, not hang the suite. A test that only hangs
+  // when the code is wrong is a bad signal — it reads as infrastructure
+  // trouble rather than a caught defect.
+  const long = d.queue.runLong('sid', () => new Promise((r) => setTimeout(r, 60)));
+  assert.strictEqual(d.queue.isBusy('sid'), true, 'busy the moment the long action is started');
+
+  const w = new SessionWatcher('sid', () => {});
+  let typed = false;
+  w.submit = async () => { typed = true; return { ok: true }; };
+  d.watchers.set('sid', w);
+
+  await d._handleMessage(JSON.stringify({ type: 'submit', sessionId: 'sid', text: 'hi' }));
+  assert.strictEqual(typed, false, 'nothing was typed');
+  assert.strictEqual(sent.length, 1);
+  assert.strictEqual(sent[0].ok, false);
+  assert.match(sent[0].error, /busy/);
+  await long;
+  assert.strictEqual(typed, false, 'and still not typed once the long action finished');
+  w.close();
+});
+
+test('newSession: two new conversations at once refuses to type into either', async (t) => {
+  // Recorded as fixed after round 8 and never actually written. The code
+  // still took the first id absent from the snapshot, so anything else
+  // opening a Claude webview inside the window received the prompt.
+  t.mock.method(cdp, 'listClaudeSessions', async () => {
+    return calls++ === 0
+      ? [{ sessionId: 'old' }]
+      : [{ sessionId: 'old' }, { sessionId: 'new-a' }, { sessionId: 'new-b' }];
+  });
+  let calls = 0;
+  t.mock.method(cdp, 'withSidebar', async () => ({ ok: true }));
+  const submits = [];
+  t.mock.method(cdp, 'findTarget', async () => {
+    submits.push('attached');
+    throw new Error('should never get here');
+  });
+
+  const out = await new Daemon().newSession('hello');
+  assert.strictEqual(out.ok, false);
+  assert.match(out.error, /new conversations appeared at once/);
+  assert.deepStrictEqual(submits, [], 'nothing was typed into anything');
+});
+
+test('newSession: exactly one new conversation is used', async (t) => {
+  let calls = 0;
+  t.mock.method(cdp, 'listClaudeSessions', async () =>
+    calls++ === 0 ? [{ sessionId: 'old' }] : [{ sessionId: 'old' }, { sessionId: 'fresh' }]
+  );
+  t.mock.method(cdp, 'withSidebar', async () => ({ ok: true }));
+  const d = new Daemon();
+  d._typeIntoNewSession = async (id) => ({ ok: true, sessionId: id });
+  const out = await d.newSession('hello');
+  assert.strictEqual(out.ok, true);
+  assert.strictEqual(out.sessionId, 'fresh');
+});
+
+// A fake `run` that walks the same states the real flow does: no panel,
+// then a command menu once /mcp is typed, then a list once the entry is
+// clicked. A fake that reports the panel already open would take the
+// early return and prove nothing.
+function fakeMcpRun({ draft = '', clearFails = false, restoreFails = false }) {
+  let opened = false;
+  return async (expr) => {
+    if (expr.includes('commandItem_') && expr.includes('draft')) {
+      return { items: opened ? [] : ['/mcp'], draft, structured: false };
+    }
+    if (expr.includes('serverItem_')) {
+      return opened
+        ? { panel: 'list', title: null, rows: [], menuOpen: false }
+        : { panel: 'none', title: null, rows: [], menuOpen: false };
+    }
+    if (expr.includes('commandLabel_')) {
+      opened = true;
+      return { ok: true };
+    }
+    // insertText first: injectExpr contains both insertText and
+    // execCommand, so checking execCommand first makes every injection
+    // look like a clear.
+    if (expr.includes('insertText')) {
+      return restoreFails ? { ok: false, reason: 'no input candidates found' } : { ok: true };
+    }
+    if (expr.includes('selectAll')) {
+      return clearFails ? { ok: false, reason: 'composer vanished' } : { ok: true };
+    }
+    return { ok: true };
+  };
+}
+
+test('openMcpPanel: leaving /mcp behind is a note, not a failed action', async () => {
+  // Failing the whole action because the composer could not be tidied is
+  // what broke this feature once: the editor answers false from
+  // selectAll and performs it anyway, so an over-strict cleanup check
+  // turned every MCP action into "could not clear /mcp".
+  const out = await openMcpPanel(fakeMcpRun({ draft: '', clearFails: true }));
+  assert.strictEqual(out.ok, true, 'the panel opened, which is what was asked for');
+  assert.match(out.note, /^note:/);
+  assert.match(out.note, /may be left in the laptop composer/);
+});
+
+test('openMcpPanel: a draft that did not come back does fail the action', async () => {
+  const out = await openMcpPanel(fakeMcpRun({ draft: 'half a sentence', restoreFails: true }));
+  assert.strictEqual(out.ok, false, 'losing what someone was typing is not a note');
+  assert.match(out.error, /draft was not put back/);
+});
+
+test('openMcpPanel: a clean run carries no note', async () => {
+  const out = await openMcpPanel(fakeMcpRun({ draft: 'hello' }));
+  assert.strictEqual(out.ok, true);
+  assert.strictEqual(out.note, null);
 });

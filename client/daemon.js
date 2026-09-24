@@ -210,7 +210,12 @@ const MCP_STATE_EXPR = `
   })).filter((r) => r.name);
   const menuOpen = !!document.querySelector('[class*="commandItem_"]');
   if (detail) return { panel: 'detail', title: t(detail), rows, menuOpen };
-  if (rows.length) return { panel: 'list', title: null, rows, menuOpen };
+  // The list container, not the rows. Using row count as the marker
+  // makes a panel with no configured servers indistinguishable from no
+  // panel at all, so opening one times out and the phone is told it
+  // failed to open rather than shown its own empty state.
+  const list = document.querySelector('[class*="serverList_"], [class*="emptyState_"]');
+  if (list || rows.length) return { panel: 'list', title: null, rows, menuOpen };
   return { panel: 'none', title: null, rows: [], menuOpen };
 })()
 `;
@@ -289,14 +294,30 @@ function clickReconnectFor(name) {
   const title = titles[0];
   const shown = title && (title.textContent || '').trim();
   if (shown !== wanted) return { ok: false, reason: 'detail view shows ' + JSON.stringify(shown) + ', not ' + JSON.stringify(wanted) };
-  // Scope the button to the panel the title belongs to. Verifying a
-  // document-wide title and then clicking a document-wide button checks
-  // one element and acts on another: any earlier mounted section with an
-  // exact-text Reconnect satisfies both, and they need share no ancestor.
-  let panel = title;
-  while (panel && !panel.querySelector('[class*="detailActions_"]')) panel = panel.parentElement;
+
+  // One action row in the whole document, and it has to be inside an
+  // ancestor of the verified title.
+  //
+  // Climbing to "the first ancestor with a detailActions_ descendant" can
+  // reach a root shared with a sibling panel, and a single exact-text
+  // Reconnect under that root then passes every later check while
+  // belonging to the other panel. Counting detail action rows document-
+  // wide catches that directly: in this markup an action row only exists
+  // inside a detail view, so a second one means a second panel.
+  const allActions = [...document.querySelectorAll('[class*="detailActions_"]')];
+  if (allActions.length > 1) return { ok: false, reason: 'more than one detail action row is mounted' };
+  if (!allActions.length) return { ok: false, reason: 'no detail actions are mounted' };
+  const actions = allActions[0];
+
+  let panel = title.parentElement;
+  let hops = 0;
+  while (panel && hops < 8 && !panel.contains(actions)) {
+    panel = panel.parentElement;
+    hops += 1;
+  }
   if (!panel) return { ok: false, reason: 'found the title but not the actions it belongs to' };
-  const btns = [...panel.querySelectorAll('[class*="actionButton_"]')]
+
+  const btns = [...actions.querySelectorAll('[class*="actionButton_"]')]
     .filter((el) => (el.textContent || '').trim() === 'Reconnect');
   if (!btns.length) return { ok: false, reason: 'no Reconnect button in this detail view' };
   if (btns.length > 1) return { ok: false, reason: 'several Reconnect buttons in one detail view' };
@@ -720,12 +741,14 @@ const CLEAR_COMPOSER_EXPR = `
   const box = [...document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')].pop();
   if (!box) return { ok: false, reason: 'no composer' };
   box.focus();
-  // execCommand returns false when refused. Discarding that was how a
-  // "cleared" composer could still hold text, so the next insertion
-  // appended to it instead of replacing it.
-  if (!document.execCommand('selectAll')) return { ok: false, reason: 'selectAll refused' };
-  if (!document.execCommand('delete')) return { ok: false, reason: 'delete refused' };
-  const left = (box.value !== undefined ? box.value : box.textContent) || '';
+  // execCommand's return value is not evidence here: this editor answers
+  // false for selectAll and performs it anyway, and trusting that made
+  // every MCP action fail with "selectAll refused" on a flow that had
+  // been working. Read the composer back instead — what is in it is the
+  // only thing that matters.
+  document.execCommand('selectAll');
+  document.execCommand('delete');
+  const left = (box.value !== undefined ? box.value : box.innerText) || '';
   if (left.trim()) return { ok: false, reason: 'composer still holds text after clearing' };
   return { ok: true };
 })()
@@ -769,10 +792,34 @@ async function openMcpPanel(run) {
   }
 
   let mutated = false;
+  let note = null;
+  // Returns null when the composer is back as it was found, or a sentence
+  // when it is not. Swallowing these meant an action could report success
+  // having lost someone's draft — the one outcome the save/restore exists
+  // to prevent.
+  // Returns null when the composer is back as it was found, or a
+  // sentence when it is not. Losing a draft is the outcome this exists to
+  // prevent and is reported as a failure; leaving "/mcp" behind in an
+  // empty composer is untidy rather than destructive, so it is reported
+  // as a note on an otherwise successful action. Failing the whole
+  // reconnect over the untidy case is what broke this once already.
   const restore = async () => {
-    if (!mutated) return;
-    await run(CLEAR_COMPOSER_EXPR).catch(() => {});
-    if (draft) await run(injectExpr(draft)).catch(() => {});
+    if (!mutated) return null;
+    let cleared = { ok: false, reason: 'not attempted' };
+    try {
+      cleared = await run(CLEAR_COMPOSER_EXPR);
+    } catch (err) {
+      cleared = { ok: false, reason: err.message };
+    }
+    if (!draft) return cleared.ok ? null : `note: "/mcp" may be left in the laptop composer (${cleared.reason})`;
+    let back;
+    try {
+      back = await run(injectExpr(draft));
+    } catch (err) {
+      back = { ok: false, reason: err.message };
+    }
+    if (!back.ok) return `your laptop draft was not put back (${back.reason}) — check the laptop`;
+    return null;
   };
 
   try {
@@ -783,8 +830,8 @@ async function openMcpPanel(run) {
     mutated = true;
     const typed = await run(injectExpr('/mcp'));
     if (!typed.ok) {
-      await restore();
-      return { ok: false, error: `could not type /mcp: ${typed.reason}` };
+      const lost = await restore();
+      return { ok: false, error: `could not type /mcp: ${typed.reason}${lost ? `; ${lost}` : ''}` };
     }
 
     const menu = await waitFor(
@@ -794,18 +841,21 @@ async function openMcpPanel(run) {
       { timeoutMs: 5000 },
     );
     if (!menu.items.length) {
-      await restore();
-      return { ok: false, error: 'typing /mcp opened no command menu' };
+      const lost = await restore();
+      return { ok: false, error: `typing /mcp opened no command menu${lost ? `; ${lost}` : ''}` };
     }
 
     const picked = await run(CLICK_MCP_COMMAND_EXPR);
-    await restore();
+    const lost = await restore();
     if (!picked.ok) {
       return {
         ok: false,
-        error: `${picked.reason}${picked.seen && picked.seen.length ? ` (menu showed: ${picked.seen.join(', ')})` : ''}`,
+        error: `${picked.reason}${picked.seen && picked.seen.length ? ` (menu showed: ${picked.seen.join(', ')})` : ''}${lost ? `; ${lost}` : ''}`,
       };
     }
+    // Only a draft that did not come back stops the action.
+    if (lost && !lost.startsWith('note:')) return { ok: false, error: lost };
+    if (lost) note = lost;
   } catch (err) {
     // Any throw in here leaves "/mcp" sitting in someone's composer
     // unless the restore runs. That is the whole reason for the finally
@@ -816,7 +866,7 @@ async function openMcpPanel(run) {
 
   state = await waitFor(run, MCP_STATE_EXPR, (st) => st.panel !== 'none');
   if (state.panel === 'none') return { ok: false, error: 'the MCP panel did not open' };
-  return { ok: true, state };
+  return { ok: true, state, note };
 }
 
 async function closeMcpPanel(run) {
@@ -952,6 +1002,34 @@ async function reconnectMcpServer(run, name) {
 class SessionQueue {
   constructor() {
     this.tails = new Map(); // sessionId -> promise chain
+    this.busy = new Set(); // sessions with long work in flight
+  }
+
+  // Whether a long action holds this session. The phone gives a submit
+  // five seconds before it tells the author the message may not have
+  // been sent and hands the text back; a reconnect can hold the queue for
+  // twenty-four. Queueing behind that means the daemon types the message
+  // long after the phone disowned it, so the author has the text back
+  // *and* it was sent.
+  isBusy(sessionId) {
+    return this.busy.has(sessionId);
+  }
+
+  // Marks the session busy for the duration, so submits can be refused
+  // rather than silently delayed past their deadline.
+  runLong(sessionId, fn) {
+    // Marked synchronously, before the chain. Setting it inside the
+    // queued function defers it by a microtask, and a submit arriving in
+    // that window sees an idle session and queues behind the long action
+    // instead of being refused — the delay this exists to prevent.
+    this.busy.add(sessionId);
+    return this.run(sessionId, async () => {
+      try {
+        return await fn();
+      } finally {
+        this.busy.delete(sessionId);
+      }
+    });
   }
 
   run(sessionId, fn) {
@@ -1137,6 +1215,15 @@ class Daemon {
     }
 
     if (msg.type === 'submit') {
+      if (this.queue.isBusy(msg.sessionId)) {
+        this._send({
+          type: 'submit_ack',
+          sessionId: msg.sessionId,
+          ok: false,
+          error: 'busy driving Claude Code on the laptop — try again in a moment',
+        });
+        return;
+      }
       const watcher = this.watchers.get(msg.sessionId);
       if (watcher) {
         // Queued for the same reason the MCP actions are: this types into
@@ -1228,7 +1315,7 @@ class Daemon {
     const picked = await this._mcpSessionId();
     if (picked.error) return { ok: false, error: picked.error };
     const sessionId = picked.sessionId;
-    const out = await this.queue.run(sessionId, () =>
+    const out = await this.queue.runLong(sessionId, () =>
       this._withSession(sessionId, (run) => readMcpServers(run))
     );
     return { ...out, sessionId };
@@ -1238,7 +1325,7 @@ class Daemon {
     const picked = await this._mcpSessionId();
     if (picked.error) return { ok: false, error: picked.error };
     const sessionId = picked.sessionId;
-    const out = await this.queue.run(sessionId, () =>
+    const out = await this.queue.runLong(sessionId, () =>
       this._withSession(sessionId, (run) => reconnectMcpServer(run, name))
     );
     return { ...out, sessionId };
@@ -1272,14 +1359,26 @@ class Daemon {
       } catch (err) {
         continue;
       }
-      fresh = now.map((t) => t.sessionId).find((id) => !before.has(id)) || null;
+      // The whole difference, not the first of it. Taking the first id
+      // absent from the snapshot means that if anything else opened a
+      // Claude webview inside this window — VS Code restoring one, or
+      // the author starting one on the laptop — the phone's prompt goes
+      // into that conversation instead.
+      const added = now.map((t) => t.sessionId).filter((id) => !before.has(id));
+      if (added.length > 1) {
+        return {
+          ok: false,
+          error: `${added.length} new conversations appeared at once — not typing into any of them`,
+        };
+      }
+      fresh = added[0] || null;
     }
     if (!fresh) return { ok: false, error: 'clicked New session but no new session appeared' };
     if (!text) return { ok: true, sessionId: fresh };
 
     // The new webview mounts before its composer does, so retry rather
     // than racing it.
-    return await this.queue.run(fresh, () => this._typeIntoNewSession(fresh, text));
+    return await this.queue.runLong(fresh, () => this._typeIntoNewSession(fresh, text));
   }
 
   // Retry until the brand-new webview has a composer, but never after the
