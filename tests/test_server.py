@@ -198,15 +198,42 @@ class SessionStateTests(IsolatedState):
             "it is kept under a name that says what it is",
         )
 
-    def test_save_is_atomic_and_leaves_no_temp_behind(self):
+    def test_save_never_writes_the_live_file_directly(self):
+        """Atomicity here *is* the mechanism: the target is only ever
+        replaced by a rename, so a reader sees the old file or the new one
+        and never a truncated one. Writing the target directly is what
+        made an interrupted save load as [] — and it is interruptible in
+        the ordinary course of things, since watchfiles SIGTERMs the
+        server on every deploy and this rewrites on every poll."""
         st = self.make(["<div>a</div>"])
-        st.save()
+        target = st.path()
+        written, renamed = [], []
+        real_write, real_replace = server.Path.write_text, server.os.replace
+
+        def spy_write(self, *a, **kw):
+            written.append(Path(self))
+            return real_write(self, *a, **kw)
+
+        def spy_replace(src, dst, *a, **kw):
+            renamed.append((Path(src), Path(dst)))
+            return real_replace(src, dst, *a, **kw)
+
+        server.Path.write_text = spy_write
+        server.os.replace = spy_replace
+        try:
+            st.save()
+        finally:
+            server.Path.write_text = real_write
+            server.os.replace = real_replace
+
+        self.assertNotIn(target, written, "the live file was written in place")
+        self.assertEqual([d for _, d in renamed], [target], "it is only ever renamed over")
+        self.assertFalse(
+            target.with_suffix(".json.tmp").exists(), "and the scratch file is not left behind"
+        )
         fresh = server.SessionState(st.session_id)
         fresh.load()
         self.assertEqual(fresh.turns, ["<div>a</div>"])
-        self.assertFalse(
-            st.path().with_suffix(".json.tmp").exists(), "the scratch file is renamed, not left"
-        )
 
     def test_a_full_disk_does_not_take_the_frame_loop_with_it(self):
         st = self.make(["<div>a</div>"])
