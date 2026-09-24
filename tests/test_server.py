@@ -739,6 +739,35 @@ class ActionRouteTests(AioHTTPTestCase, IsolatedState):
         # And an exception that carries nothing still says something.
         self.assertTrue(server.describe_daemon_failure(RuntimeError()))
 
+    async def test_the_sessions_route_uses_the_description_not_str(self):
+        """Proving the helper is right proves nothing about the route that
+        was rendering the empty string. Patched rather than waited out: the
+        real path is a five-second timeout."""
+        original = server.request_list_sessions
+
+        async def times_out(*a, **kw):
+            raise asyncio.TimeoutError()
+
+        server.request_list_sessions = times_out
+        self.addCleanup(lambda: setattr(server, "request_list_sessions", original))
+        resp = await self.client.get("/api/sessions", headers=AUTH_HEADER)
+        self.assertEqual(resp.status, 503)
+        body = await resp.json()
+        self.assertIn("did not answer", body["error"])
+
+    async def test_the_action_route_uses_the_description_not_str(self):
+        original = server.request_action
+
+        async def times_out(*a, **kw):
+            raise asyncio.TimeoutError()
+
+        server.request_action = times_out
+        self.addCleanup(lambda: setattr(server, "request_action", original))
+        resp = await self.client.post("/api/mcp", json={}, headers=AUTH_HEADER)
+        self.assertEqual(resp.status, 503)
+        body = await resp.json()
+        self.assertIn("did not answer", body["error"])
+
     async def test_submit_ack_goes_to_the_tab_that_submitted(self):
         """submit_ack carries nothing to correlate on. Broadcast, it makes a
         second tab clear its own pending send, report "send failed" and hand
