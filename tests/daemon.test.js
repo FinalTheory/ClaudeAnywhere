@@ -1304,16 +1304,36 @@ test('CLEAR_COMPOSER_EXPR: text surviving the clear is a failure', () => {
   assert.match(out.reason, /still holds text/);
 });
 
-test('MENU_STATE_EXPR: a rich draft is flagged as unrestorable', () => {
-  // textContent flattens <p>a</p><p>b</p> to "ab"; putting that back
-  // would rewrite what the author typed.
-  const mk = (text, html) => ({
-    querySelectorAll: (sel) =>
-      sel.includes('commandItem_') ? [] : [{ value: text, innerHTML: html, textContent: text }],
+test('MENU_STATE_EXPR: only a draft with a line break is unrestorable', () => {
+  // The question is whether a plain-text round trip reproduces what is
+  // there, not whether the markup looks rich. A contenteditable wraps
+  // even one typed line as <p>hello</p>, so testing the HTML refused
+  // every non-empty draft — including all the restorable ones.
+  //
+  // innerText is what makes the real distinction visible: it renders
+  // <p>a</p><p>b</p> with a line break between them, where textContent
+  // would have flattened it to "ab" and hidden the problem.
+  const editor = (innerText, innerHTML) => ({
+    querySelectorAll: (sel) => (sel.includes('commandItem_') ? [] : [{ innerText, innerHTML }]),
   });
-  assert.strictEqual(runExpr(MENU_STATE_EXPR, mk('hello', 'hello')).structured, false);
-  assert.strictEqual(runExpr(MENU_STATE_EXPR, mk('a\nb', 'a<br>b')).structured, true);
-  assert.strictEqual(runExpr(MENU_STATE_EXPR, mk('ab', '<p>a</p><p>b</p>')).structured, true);
+  const textarea = (value) => ({
+    querySelectorAll: (sel) => (sel.includes('commandItem_') ? [] : [{ value }]),
+  });
+
+  const oneLine = runExpr(MENU_STATE_EXPR, editor('hello', '<p>hello</p>'));
+  assert.strictEqual(oneLine.draft, 'hello');
+  assert.strictEqual(oneLine.structured, false, 'a single wrapped line is restorable');
+
+  const empty = runExpr(MENU_STATE_EXPR, editor('', '<p><br></p>'));
+  assert.strictEqual(empty.structured, false, 'an untouched editor is not a draft');
+
+  assert.strictEqual(
+    runExpr(MENU_STATE_EXPR, editor('a\nb', '<p>a</p><p>b</p>')).structured,
+    true,
+    'two paragraphs cannot survive a plain-text round trip',
+  );
+  assert.strictEqual(runExpr(MENU_STATE_EXPR, textarea('plain')).structured, false);
+  assert.strictEqual(runExpr(MENU_STATE_EXPR, textarea('a\nb')).structured, true);
 });
 
 // --- the queue ------------------------------------------------------------

@@ -666,13 +666,26 @@ const MENU_STATE_EXPR = `
   });
   const box = [...document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')].pop();
   if (!box) return { items, draft: null, structured: false };
-  const draft = (box.value !== undefined ? box.value : box.textContent) || '';
-  // textContent flattens a rich editor: <p>a</p><p>b</p> reads as "ab",
-  // and putting that back as plain text would silently rewrite what the
-  // author had typed. Anything that is not one plain line is not
-  // something this can promise to restore.
-  const html = box.innerHTML !== undefined ? box.innerHTML : '';
-  const structured = /[\\r\\n]/.test(draft) || /<(p|div|br|ul|ol|li|pre|code)[ >]/i.test(html);
+  // innerText, not textContent. textContent flattens a rich editor —
+  // <p>a</p><p>b</p> reads as "ab" — so restoring that as plain text
+  // would silently join two paragraphs. innerText renders the same DOM
+  // with a line break between them, which makes the difference
+  // detectable and makes a plain-text round trip faithful whenever there
+  // is only one line.
+  //
+  // Asking the HTML whether it looks structured was the wrong question.
+  // A contenteditable wraps even one typed line as <p>hello</p>, so that
+  // test refused every non-empty draft — including every draft this can
+  // restore perfectly, which is nearly all of them.
+  const draft = (box.value !== undefined ? box.value : box.innerText) || '';
+  // No backslashes here, deliberately. These expressions live in a
+  // template literal, so every escape is consumed once before the page
+  // sees it — a newline class written as a regex arrives containing real
+  // line breaks and fails to parse at runtime. That has bitten three
+  // times, including in a comment explaining it. fromCharCode cannot.
+  const LF = String.fromCharCode(10);
+  const CR = String.fromCharCode(13);
+  const structured = draft.indexOf(LF) >= 0 || draft.indexOf(CR) >= 0;
   return { items, draft, structured };
 })()
 `;
