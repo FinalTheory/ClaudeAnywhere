@@ -235,11 +235,9 @@ mcpRefreshBtn.onclick = () => {
   const loaded = mcpListEl.childElementCount > 0;
   if (loaded && !mcpListEl.hidden) {
     mcpListEl.hidden = true;
-    mcpRefreshBtn.classList.remove('open');
     return;
   }
   mcpListEl.hidden = false;
-  mcpRefreshBtn.classList.add('open');
   if (!loaded) refreshMcp();
 };
 
