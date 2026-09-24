@@ -1562,9 +1562,17 @@ test('SessionQueue: a second long action is refused, not queued behind the first
   const q = new SessionQueue();
   let released;
   const first = q.runLong('s', () => new Promise((r) => { released = r; }));
-  const second = await q.runLong('s', async () => {
-    throw new Error('the second action must not run');
-  });
+  // Bounded, because the defect makes the second call queue behind a
+  // holder that is still running: awaiting it plainly would signal by
+  // hanging until the runner's timeout, which reads like a stuck suite
+  // rather than a failed assertion.
+  const second = await Promise.race([
+    q.runLong('s', async () => {
+      throw new Error('the second action must not run');
+    }),
+    new Promise((r) => setTimeout(() => r({ queued: true }), 60)),
+  ]);
+  assert.ok(!second.queued, 'the second long action queued instead of being refused');
   assert.strictEqual(second.ok, false);
   assert.match(second.error, /already driving Claude Code/);
   assert.strictEqual(q.isBusy('s'), true, 'the refusal did not disturb the holder');
@@ -1580,7 +1588,10 @@ test('SessionQueue: the first long action still holds the session after a refusa
   const q = new SessionQueue();
   let released;
   const first = q.runLong('s', () => new Promise((r) => { released = r; }));
-  await q.runLong('s', async () => ({ ok: true }));
+  await Promise.race([
+    q.runLong('s', async () => ({ ok: true })),
+    new Promise((r) => setTimeout(r, 60)),
+  ]);
   // The refused caller's finally must not have cleared the holder's flag.
   assert.strictEqual(q.isBusy('s'), true);
   released();
