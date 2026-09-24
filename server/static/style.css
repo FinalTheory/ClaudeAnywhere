@@ -457,3 +457,20 @@ body > #session-detail {
 #transcript * {
   max-width: 100%;
 }
+
+/* The conversation's name. Every wrong-conversation defect found in
+   review was invisible while this view was anonymous. Its own row, like
+   the siblings around it — #session-detail is a flex column, so a growing
+   flex here would take vertical space from the transcript. Truncates
+   rather than wraps, to stay one row however long the title is. */
+#session-title {
+  flex: none;
+  padding: 6px 12px 0;
+  font-size: calc(13px * var(--app-font-scale));
+  font-weight: 600;
+  color: var(--vscode-foreground, #ccc);
+  background: var(--vscode-sideBar-background, #262626);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

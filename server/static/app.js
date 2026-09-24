@@ -12,6 +12,7 @@ const detailEl = document.getElementById('session-detail');
 const transcriptEl = document.getElementById('transcript');
 const statusEl = document.getElementById('status');
 const backBtn = document.getElementById('back-btn');
+const titleEl = document.getElementById('session-title');
 const sendForm = document.getElementById('send-form');
 const promptInput = document.getElementById('prompt-input');
 const sendBtn = sendForm.querySelector('button[type="submit"]');
@@ -25,10 +26,16 @@ let renderedTurns = [];
 // currently loaded in the DOM — the cursor for "load more history above".
 let loadedStartIndex = 0;
 let hasMore = true;
-// Tracks the one in-flight send, so we can tell "no ack ever arrived" (a
-// silent delivery failure — see the timeout below) apart from "explicit
-// failure ack", and restore the text either way.
-let pendingSend = null; // { text, timeoutId }
+// Sends awaiting an ack, oldest first, so "no ack ever arrived" (a silent
+// delivery failure — see the timeout below) can be told apart from an
+// explicit failure ack and the right text restored either way. A single
+// slot cannot describe two: send one message, send a second before the
+// first is answered, and the first ack clears the second's timer, shows
+// its error and hands back the *second* message — the one that actually
+// went. The daemon answers submits in the order it receives them and the
+// server now routes each ack to the socket that asked, so order is enough
+// to pair them.
+let pendingSends = []; // [{ text, timeoutId }]
 const SUBMIT_ACK_TIMEOUT_MS = 5000;
 
 // When the VPS last said anything on this socket. readyState is not
@@ -57,8 +64,30 @@ const DEAD_AFTER_MS = 60000;
 
 async function loadSessionList() {
   listEl.innerHTML = '<div class="list-loading">Loading…</div>';
-  const res = await fetch('/api/sessions');
-  const data = await res.json();
+  let data;
+  try {
+    const res = await fetch('/api/sessions');
+    // The auth cookie lasts thirty days and then this redirects to the
+    // login page. fetch follows the redirect and hands back HTML, res.json
+    // throws, and with nothing catching it the screen stays on "Loading…"
+    // for good — no error, no Retry, no mention of logging in. Changing
+    // AUTH_TOKEN on the VPS does the same thing.
+    if (res.redirected || res.status === 401 || res.status === 403) {
+      listEl.innerHTML = '';
+      showListNotice('Signed out', 'Your session expired. Log in again to carry on.');
+      location.href = '/login';
+      return;
+    }
+    data = await res.json();
+  } catch (err) {
+    listEl.innerHTML = '';
+    showListNotice(
+      'Could not reach the server',
+      'The VPS did not answer. It may be restarting — this retries by itself when you tap Retry.',
+      err.message,
+    );
+    return;
+  }
   listEl.innerHTML = '';
   // Three ways to have no sessions, and they need different answers from
   // you. An empty list used to mean all of them.
@@ -76,6 +105,17 @@ async function loadSessionList() {
       'The daemon is up, but nothing answered on the debug port — VS Code is closed, ' +
         'restarting, or was started without --remote-debugging-port.',
       data.cdpError,
+    );
+    return;
+  }
+  if (!Array.isArray(data.sessions)) {
+    // A 200 whose body is not the shape this expects would otherwise
+    // throw inside an async function nobody awaits: the list has already
+    // been emptied by this point, so the screen goes blank and silent.
+    showListNotice(
+      'Unexpected answer from the server',
+      'The session list came back in a shape this page does not understand.',
+      JSON.stringify(data).slice(0, 200),
     );
     return;
   }
@@ -109,7 +149,7 @@ async function loadSessionList() {
     chevron.textContent = '›'; // ›
 
     div.append(dot, text, chevron);
-    div.onclick = () => openSession(s.sessionId);
+    div.onclick = () => openSession(s.sessionId, s.title);
     listEl.appendChild(div);
   }
 }
@@ -251,13 +291,18 @@ function renderMcp(out) {
   }
 }
 
+let mcpLoaded = false;
+
 async function refreshMcp() {
   mcpRefreshBtn.disabled = true;
   mcpListEl.innerHTML = '<p class="action-status">Opening the MCP panel on the laptop…</p>';
   try {
-    renderMcp(await postJson('/api/mcp', {}));
+    const out = await postJson('/api/mcp', {});
+    renderMcp(out);
+    mcpLoaded = !!(out.ok && out.servers && out.servers.length);
   } catch (err) {
     renderMcp({ ok: false, error: err.message });
+    mcpLoaded = false;
   } finally {
     mcpRefreshBtn.disabled = false;
   }
@@ -268,7 +313,11 @@ async function refreshMcp() {
 // Collapsing keeps the DOM so re-opening is instant and does not disturb
 // the laptop again.
 mcpRefreshBtn.onclick = () => {
-  const loaded = mcpListEl.childElementCount > 0;
+  // Explicit, because the error line and "No MCP servers listed." are
+  // children too: inferring loaded from the child count turns the retry
+  // tap after a failure into a hide tap, and caches an empty answer with
+  // no way to ask again short of reloading the page.
+  const loaded = mcpLoaded;
   if (loaded && !mcpListEl.hidden) {
     mcpListEl.hidden = true;
     return;
@@ -277,7 +326,7 @@ mcpRefreshBtn.onclick = () => {
   if (!loaded) refreshMcp();
 };
 
-function showListNotice(heading, detail, raw) {
+function showListNotice(heading, detail, raw, withRetry = true) {
   const wrap = document.createElement('div');
   wrap.className = 'list-error';
   const h = document.createElement('p');
@@ -292,14 +341,41 @@ function showListNotice(heading, detail, raw) {
     pre.textContent = raw;
     wrap.appendChild(pre);
   }
-  const retry = document.createElement('button');
-  retry.textContent = 'Retry';
-  retry.onclick = loadSessionList;
-  wrap.appendChild(retry);
+  if (withRetry) {
+    const retry = document.createElement('button');
+    retry.textContent = 'Retry';
+    retry.onclick = loadSessionList;
+    wrap.appendChild(retry);
+  }
   listEl.appendChild(wrap);
 }
 
-function openSession(sessionId) {
+// Everything in flight for the conversation being left. The view reset in
+// openSession/backBtn covers what is on screen; these are the things that
+// outlive it and then act on the next conversation: a send timer that
+// fires five seconds later and injects the old prompt into the new
+// composer, a queued message that goes out the moment the old session is
+// next opened — hours later — and a draft that follows the author between
+// conversations. Returns the abandoned queue so the caller can say so.
+function leaveSession() {
+  for (const p of pendingSends) clearTimeout(p.timeoutId);
+  pendingSends = [];
+  const abandoned = queuedSends.filter((q) => q.sessionId === currentSessionId);
+  queuedSends = queuedSends.filter((q) => q.sessionId !== currentSessionId);
+  promptInput.value = '';
+  promptInput.style.height = 'auto';
+  clearNote();
+  return abandoned;
+}
+
+function openSession(sessionId, title) {
+  leaveSession();
+  // Named on screen because every wrong-conversation defect found here —
+  // a queued message flushed onto the next socket, a frame from a closing
+  // one, a send timer firing after Back — is undetectable by the author
+  // while the view is anonymous. The id is the fallback: it is what
+  // everything else addresses by, so it is never missing.
+  titleEl.textContent = title || sessionId;
   currentSessionId = sessionId;
   loadedStartIndex = 0;
   hasMore = true;
@@ -343,6 +419,11 @@ function connectPhoneWs(sessionId, delay) {
     // top of the one running — the phone would end up holding two, each
     // rendering into the same transcript.
     if (gen !== wsGeneration || sessionId !== currentSessionId) return;
+    // The VPS restarts on every deploy, so this is a designed-in event —
+    // but until it is said out loud, the only place the phone admits the
+    // link is down is the send path, which means finding out by trying to
+    // send. The transcript otherwise just stops moving.
+    setNote('Reconnecting to the server…');
     const nextDelay = Math.min((delay || 500) * 2, 8000);
     setTimeout(() => connectPhoneWs(sessionId, nextDelay), delay || 500);
   };
@@ -352,11 +433,22 @@ function connectPhoneWs(sessionId, delay) {
     // into whatever conversation is on screen now.
     if (gen !== wsGeneration || sessionId !== currentSessionId) return;
     lastInboundAt = Date.now();
+    clearNote();
     const mine = queuedSends.filter((q) => q.sessionId === sessionId);
     queuedSends = queuedSends.filter((q) => q.sessionId !== sessionId);
     for (const q of mine) submitText(q.text);
   };
   ws.onmessage = (ev) => {
+    // The same guard onclose and onopen carry. close() does not discard
+    // frames already in flight and the browser keeps dispatching `message`
+    // while the socket is CLOSING, so backing out of a streaming session
+    // into another one lets a frame from the first land in the second's
+    // transcript — as an append, or as a resync that calls renderWindow
+    // and replaces the view outright. `state`, `append` and `resync` carry
+    // no sessionId, so there is nothing else to filter on: the socket's
+    // own identity is the only evidence of which conversation a frame
+    // describes.
+    if (gen !== wsGeneration || sessionId !== currentSessionId) return;
     lastInboundAt = Date.now();
     const msg = JSON.parse(ev.data);
     if (msg.type === 'pong') return; // liveness only; the timestamp is the payload
@@ -395,34 +487,59 @@ function connectPhoneWs(sessionId, delay) {
       // reach a person. Dropped, they leave the transcript frozen on
       // "Running..." with nothing to explain it. No `state` frame follows
       // an outage, so this stays on screen until the session recovers.
-      setStatus(null, msg.message);
+      setNote(msg.message);
     } else if (msg.type === 'laptop') {
       // The VPS lost or regained the daemon. The phone's own liveness ping
       // only proves the VPS is up, so nothing else distinguishes a laptop
       // asleep from a conversation that has gone quiet.
-      setStatus(null, msg.connected ? null : 'Laptop disconnected — waiting for it to come back');
+      if (msg.connected) clearNote();
+      else setNote('Laptop disconnected — waiting for it to come back');
     } else if (msg.type === 'submit_ack') {
-      if (pendingSend) clearTimeout(pendingSend.timeoutId);
+      const answered = pendingSends.shift();
+      if (answered) clearTimeout(answered.timeoutId);
       if (!msg.ok) {
-        setStatus(null, `send failed: ${msg.error || 'unknown error'}`);
+        setNote(`send failed: ${msg.error || 'unknown error'}`);
         // The input was cleared optimistically on send (see sendForm.onsubmit)
         // — a visible error alone still leaves the user retyping a message
         // that "failed" for reasons that had nothing to do with what they
         // typed. Restore it, but only into an empty box: if they've already
         // started composing something new by the time this ack arrives,
         // don't clobber that.
-        if (pendingSend && !promptInput.value) {
-          promptInput.value = pendingSend.text;
+        if (answered && !promptInput.value) {
+          promptInput.value = answered.text;
           promptInput.dispatchEvent(new Event('input')); // re-trigger auto-grow
         }
       }
-      pendingSend = null;
     }
   };
 }
 
+// A note outranks the running state until something clears it. Without
+// that, the one instrument built to reach a person is displayed for less
+// than a frame: the daemon emits its DOM-mismatch warning and, in the same
+// tick, a `state` frame — on a fresh watcher `lastRunning` is null, so one
+// always follows — and the phone renders the warning and overwrites it.
+// "send failed" and the send-timeout note were erased the same way, which
+// is what left a restored message sitting in the composer unexplained.
+let statusNote = null;
+let lastRunning = null;
+
+function setNote(note) {
+  statusNote = note;
+  setStatus(lastRunning);
+}
+
+function clearNote() {
+  statusNote = null;
+  setStatus(lastRunning);
+}
+
 function setStatus(running, note) {
-  statusEl.textContent = note || (running ? 'Running...' : running === false ? 'Idle' : 'Unknown');
+  if (note !== undefined) statusNote = note;
+  lastRunning = running;
+  const shown = statusNote;
+  statusEl.textContent =
+    shown || (running ? 'Running...' : running === false ? 'Idle' : 'Unknown');
   // Not a hard disable anymore — confirmed in practice this deadlocks: the
   // send-button/aria-label flip means "busy" whenever the assistant's turn
   // isn't finished, which is ALSO true while it's blocked on a pending
@@ -658,6 +775,10 @@ async function loadOlder() {
     const res = await fetch(
       `/api/session/${askedFor}/history?before_index=${askedFrom}&limit_bytes=2048`
     );
+    // Without this, an error body parses into an object with no `turns`
+    // and sets hasMore = false — so one blip while scrolling permanently
+    // ends pagination for the session, silently.
+    if (!res.ok) throw new Error(`history request returned HTTP ${res.status}`);
     const data = await res.json();
     if (loadedStartIndex !== askedFrom || currentSessionId !== askedFor) {
       return; // window moved under us — scrolling again asks from the new cursor
@@ -673,6 +794,9 @@ async function loadOlder() {
     loadedStartIndex = data.start_index;
     hasMore = data.has_more;
     transcriptEl.scrollTop = transcriptEl.scrollHeight - prevHeight;
+  } catch (err) {
+    // hasMore stays true: scrolling again retries from the same cursor.
+    setNote(`Could not load older messages (${err.message}) — scroll up again to retry`);
   } finally {
     loadingMore = false;
   }
@@ -696,11 +820,21 @@ document.addEventListener('visibilitychange', () => {
 });
 
 backBtn.onclick = () => {
+  // Dropped rather than delivered later: onclose stops redialling once
+  // currentSessionId is null, so a queued message would sit undrained
+  // until that conversation is next opened and then be submitted out of
+  // nowhere. It never left the phone, so the honest move is to say so and
+  // put the text where it can be copied back.
+  const abandoned = leaveSession();
   if (ws) ws.close();
   detailEl.style.display = 'none';
   document.getElementById('session-list').style.display = 'block';
   currentSessionId = null;
-  loadSessionList();
+  loadSessionList().then(() => {
+    for (const q of abandoned) {
+      showListNotice('Message not sent', 'You left before it could go. The text:', q.text, false);
+    }
+  });
 };
 
 // Auto-grow with content (capped by max-height in style.css, which takes
@@ -732,7 +866,7 @@ sendForm.onsubmit = (e) => {
     queuedSends.push({ sessionId: currentSessionId, text });
     promptInput.value = '';
     promptInput.style.height = 'auto';
-    setStatus(null, 'Reconnecting — your message will go as soon as it is back');
+    setNote('Reconnecting — your message will go as soon as it is back');
     connectPhoneWs(currentSessionId);
     return;
   }
@@ -744,10 +878,9 @@ function submitText(text) {
   ws.send(JSON.stringify({ type: 'submit', text }));
   promptInput.value = '';
   promptInput.style.height = 'auto';
-  if (pendingSend) clearTimeout(pendingSend.timeoutId); // shouldn't happen, but don't leak a timer if it does
-  pendingSend = {
-    text,
-    timeoutId: setTimeout(() => {
+  const entry = { text, timeoutId: null };
+  pendingSends.push(entry);
+  entry.timeoutId = setTimeout(() => {
       // readyState === OPEN at send time is not proof of delivery — send()
       // is fire-and-forget at the WebSocket API level, and a connection can
       // die between the call and the frame actually reaching the server
@@ -755,14 +888,15 @@ function submitText(text) {
       // vanished with zero error shown, during a window of daemon<->VPS
       // reconnect churn). A submit_ack that never arrives is exactly as
       // real a failure as one that explicitly says ok:false.
-      setStatus(null, 'No response — message may not have sent, restoring it');
-      if (pendingSend && !promptInput.value) {
-        promptInput.value = pendingSend.text;
+      const at = pendingSends.indexOf(entry);
+      if (at === -1) return; // already answered
+      pendingSends.splice(at, 1);
+      setNote('No response — message may not have sent, restoring it');
+      if (!promptInput.value) {
+        promptInput.value = entry.text;
         promptInput.dispatchEvent(new Event('input'));
       }
-      pendingSend = null;
-    }, SUBMIT_ACK_TIMEOUT_MS),
-  };
+    }, SUBMIT_ACK_TIMEOUT_MS);
 }
 
 // Liveness. Ping on a cadence well under the deadline so one lost packet

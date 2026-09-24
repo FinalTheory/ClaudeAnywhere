@@ -152,14 +152,27 @@ tests/                   deliberately outside server/ — deploy-watch rsyncs
 ## Tests
 
 ```bash
-node --test "tests/*.test.js"      # daemon + cdp-client
+node --test "tests/*.test.js"      # daemon + cdp-client + phone state machine
 python3 tests/test_server.py       # server: pure logic, HTTP, WS flows
 ```
 
-Both run offline. No test covers `server/static/` — that is UI work, judged by
-using it rather than by assertion, and testing it would mean a browser
-dependency. **A change confined to `server/static/` does not need a review
-round.**
+Both run offline. `tests/phone.test.js` evaluates `server/static/app.js` in a
+sixty-line DOM shim — no browser, no dependency. It covers the **state
+machine** and nothing else: that the module evaluates, that every element it
+reaches for exists in `index.html`, and that a transition leaves the right
+module-level variables describing the right conversation. Rendering, layout
+and scrolling are still judged by use, and no assertion should reach for them.
+
+That split exists because the state machine is where the defects were. A dozen
+variables are mutated from socket callbacks, timers, gestures and the
+navigation between the list and a conversation, and two review rounds found
+five defects there of one shape: something in flight for the conversation
+being left — a queued message, a send timer, a frame from the closing socket —
+acting on the conversation being opened. `close()` does not discard frames
+already in flight, and `state`/`append`/`resync` carry no `sessionId`, so the
+socket's own identity is the only evidence of which conversation a frame
+describes: **every** socket callback needs the generation guard, not just the
+ones that had it.
 
 When you add a test, prove it can fail: reintroduce the defect, confirm the test
 fails, restore. Assert the mutation target exists before writing it — a
