@@ -68,7 +68,7 @@ comment and server.py's SessionState for the details.
 ```
 client -> VPS:
   {type:"hello", token}
-  {type:"sessions_result", reqId, sessions:[{sessionId, title, preview, running}]}
+  {type:"sessions_result", reqId, sessions:[...], cdp:"ok"|"unreachable", cdpError?}
   {type:"state", sessionId, running}
   {type:"append", sessionId, turns}      # extend what VPS has
   {type:"resync", sessionId, turns}      # capped tail — VPS reconciles by
@@ -100,6 +100,14 @@ VPS -> phone:
 phone -> VPS:
   {type:"submit", text}
 ```
+
+`cdp` exists because an empty session list has three causes the phone has to
+tell apart, and two of them used to look identical. `no-daemon` (the VPS
+cannot reach the laptop at all, HTTP 503) was already distinguishable;
+`unreachable` (the daemon is up, nothing answered on port 9222 — VS Code
+closed, restarting, or launched without `--remote-debugging-port`) and `ok`
+with an empty list (VS Code running, no Claude Code tabs) were both just
+"no sessions".
 
 `startIndex` is the absolute index (into the server's stored turns list) of
 the oldest turn in that message — the cursor `/api/session/<id>/history` scroll-up

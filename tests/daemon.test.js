@@ -629,7 +629,10 @@ test('_listSessions: CDP being unreachable reports no sessions, not a throw', as
     throw err;
   });
   const d = new Daemon();
-  assert.deepStrictEqual(await d._listSessions(), []);
+  const out = await d._listSessions();
+  assert.deepStrictEqual(out.sessions, []);
+  assert.strictEqual(out.cdp, 'unreachable', 'the phone must be able to say why');
+  assert.match(out.cdpError, /fetch failed/);
 });
 
 test('_listSessions: recovers on the next call once VS Code is back', async (t) => {
@@ -646,10 +649,11 @@ test('_listSessions: recovers on the next call once VS Code is back', async (t) 
   t.mock.method(cdp, 'pickContentFrame', async () => null);
 
   const d = new Daemon();
-  assert.deepStrictEqual(await d._listSessions(), []);
+  assert.strictEqual((await d._listSessions()).cdp, 'unreachable');
   up = true;
   const back = await d._listSessions();
-  assert.deepStrictEqual(back.map((s) => s.sessionId), ['sid']);
+  assert.strictEqual(back.cdp, 'ok');
+  assert.deepStrictEqual(back.sessions.map((s) => s.sessionId), ['sid']);
 });
 
 test('a rejecting message handler is caught instead of crashing the process', async (t) => {
@@ -698,7 +702,7 @@ test('_listSessions: the active tab names its webview when the attribute is gone
     targets: [{ sessionId: 'wv-1', targetId: 'T1', url: 'u' }],
     pair: { webviewId: 'wv-1', title: 'EKP-63451' },
   });
-  const [s] = await d._listSessions();
+  const [s] = (await d._listSessions()).sessions;
   assert.strictEqual(s.title, 'EKP-63451');
 });
 
@@ -717,7 +721,7 @@ test('_listSessions: a learned title survives the session leaving the screen', a
     webviewId: 'wv-2',
     title: 'EKP-63466',
   }));
-  const out = await d._listSessions();
+  const out = (await d._listSessions()).sessions;
   assert.deepStrictEqual(
     out.map((s) => s.title),
     ['EKP-63451', 'EKP-63466'],
@@ -733,7 +737,7 @@ test('_listSessions: an ambiguous workbench teaches nothing', async (t) => {
     targets: [{ sessionId: 'wv-1', targetId: 'T1', url: 'u' }],
     pair: null,
   });
-  const [s] = await d._listSessions();
+  const [s] = (await d._listSessions()).sessions;
   assert.strictEqual(s.title, null);
   assert.strictEqual(d.learnedTitles.size, 0);
 });
@@ -762,7 +766,7 @@ test('_listSessions: a reported uuid does read the sidebar', async (t) => {
     sidebarReads++;
     return { 'u-1': 'EKP-63451' };
   });
-  const [s] = await d._listSessions();
+  const [s] = (await d._listSessions()).sessions;
   assert.strictEqual(sidebarReads, 1);
   assert.strictEqual(s.title, 'EKP-63451');
 });

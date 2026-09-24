@@ -84,6 +84,20 @@ body > #session-detail {
   padding: 16px;
   color: var(--vscode-errorForeground, #f48771);
 }
+.list-notice-heading {
+  font-size: calc(16px * var(--app-font-scale));
+  font-weight: 600;
+  color: var(--vscode-foreground, #ccc);
+  margin: 0 0 6px;
+}
+/* The underlying error text. Dimmed and small — it is there to make a
+   report actionable, not to be read every time. */
+.list-notice-raw {
+  font-size: calc(11px * var(--app-font-scale));
+  color: var(--vscode-descriptionForeground, #9aa);
+  opacity: 0.75;
+  overflow-wrap: anywhere;
+}
 .list-error button {
   margin-top: 10px;
   padding: 8px 14px;

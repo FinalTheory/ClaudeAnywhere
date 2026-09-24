@@ -32,7 +32,10 @@
 // array of complete per-message HTML fragments, never one flat string —
 // see the POLL_EXPR comment for why that distinction is load-bearing.
 //   {type:"hello", token}
-//   {type:"sessions_result", reqId, sessions:[{sessionId, title, preview, running}]}
+//   {type:"sessions_result", reqId, sessions:[{sessionId, title, preview, running}],
+//        cdp:"ok"|"unreachable", cdpError?}   // cdp says whether VS Code
+//        // answered at all — an empty list means something different in
+//        // each case, and the phone needs to say which
 //   {type:"state", sessionId, running}
 //   {type:"append", sessionId, turns}   // extend what the VPS has
 //   {type:"resync", sessionId, turns}   // capped tail; VPS splices by content overlap
@@ -555,8 +558,8 @@ class Daemon {
     }
 
     if (msg.type === 'list_sessions') {
-      const sessions = await this._listSessions();
-      this._send({ type: 'sessions_result', reqId: msg.reqId, sessions });
+      const result = await this._listSessions();
+      this._send({ type: 'sessions_result', reqId: msg.reqId, ...result });
       return;
     }
 
@@ -617,11 +620,13 @@ class Daemon {
       targets = await cdp.listClaudeSessions(CDP_PORT);
     } catch (err) {
       // VS Code is closed, restarting, or was started without
-      // --remote-debugging-port. An empty list is the honest answer —
-      // there are no open sessions — and the next /api/sessions call
-      // retries, so recovery needs no state here.
-      console.error(`CDP unreachable on port ${CDP_PORT} (${err.message}) — reporting no sessions`);
-      return [];
+      // --remote-debugging-port. The next /api/sessions call retries, so
+      // recovery needs no state here — but an empty list on its own is
+      // indistinguishable from VS Code being open with no Claude tabs,
+      // and from the phone's side both of those already look like the
+      // daemon being offline. Say which it is.
+      console.error(`CDP unreachable on port ${CDP_PORT} (${err.message}) — reporting VS Code as down`);
+      return { sessions: [], cdp: 'unreachable', cdpError: err.message };
     }
     const claims = new Map();
     const sessions = [];
@@ -711,7 +716,7 @@ class Daemon {
           `learned from tabs=${this.learnedTitles.size})`
       );
     }
-    return sessions;
+    return { sessions, cdp: 'ok' };
   }
 }
 

@@ -532,9 +532,6 @@ class WsFlowTests(AioHTTPTestCase, IsolatedState):
         await ws.close()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class MinimalStreamingTailTests(IsolatedState):
     """The daemon sends only the changed final turn while a reply streams.
@@ -564,3 +561,62 @@ class MinimalStreamingTailTests(IsolatedState):
         st = self.make(["dup", "x", "y"])
         st.apply_resync(["dup"])
         self.assertEqual(st.turns, ["dup", "x", "dup"])
+
+
+class CdpStateTests(AioHTTPTestCase, IsolatedState):
+    """An empty session list has three different causes and the phone has
+    to tell them apart: the laptop is unreachable, VS Code is not running,
+    or VS Code is running with no Claude Code tabs."""
+
+    async def get_application(self):
+        return server.make_app()
+
+    def setUp(self):
+        IsolatedState.setUp(self)
+        AioHTTPTestCase.setUp(self)
+        server.client_ws = None
+        server.client_authed = False
+        self.addCleanup(lambda: setattr(server, "client_ws", None))
+        self.addCleanup(lambda: setattr(server, "client_authed", False))
+
+    async def daemon_answering(self, payload):
+        ws = await self.client.ws_connect("/ws/client")
+        await ws.send_json({"type": "hello", "token": TOKEN})
+        await asyncio.wait_for(ws.receive_json(), timeout=5)
+
+        async def reply():
+            req = await asyncio.wait_for(ws.receive_json(), timeout=5)
+            await ws.send_json({"type": "sessions_result", "reqId": req["reqId"], **payload})
+
+        return ws, asyncio.create_task(reply())
+
+    async def test_no_daemon_is_reported_as_no_daemon(self):
+        resp = await self.client.get("/api/sessions", headers=AUTH_HEADER)
+        self.assertEqual(resp.status, 503)
+        body = await resp.json()
+        self.assertEqual(body["cdp"], "no-daemon")
+
+    async def test_daemon_up_but_vscode_down_says_so(self):
+        ws, task = await self.daemon_answering(
+            {"sessions": [], "cdp": "unreachable", "cdpError": "ECONNREFUSED 127.0.0.1:9222"}
+        )
+        resp = await self.client.get("/api/sessions", headers=AUTH_HEADER)
+        await task
+        self.assertEqual(resp.status, 200, "the laptop is fine; this is not a server error")
+        body = await resp.json()
+        self.assertEqual(body["cdp"], "unreachable")
+        self.assertIn("9222", body["cdpError"])
+        self.assertEqual(body["sessions"], [])
+        await ws.close()
+
+    async def test_vscode_up_with_no_tabs_is_an_ordinary_empty_list(self):
+        ws, task = await self.daemon_answering({"sessions": [], "cdp": "ok"})
+        resp = await self.client.get("/api/sessions", headers=AUTH_HEADER)
+        await task
+        body = await resp.json()
+        self.assertEqual(body["cdp"], "ok")
+        self.assertEqual(body["sessions"], [])
+        await ws.close()
+
+if __name__ == "__main__":
+    unittest.main()

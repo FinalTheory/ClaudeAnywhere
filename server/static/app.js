@@ -30,23 +30,27 @@ async function loadSessionList() {
   const res = await fetch('/api/sessions');
   const data = await res.json();
   listEl.innerHTML = '<div class="list-header">Sessions</div>';
-  if (data.error) {
-    const wrap = document.createElement('div');
-    wrap.className = 'list-error';
-    const p = document.createElement('p');
-    p.textContent = `Client daemon not connected: ${data.error}`;
-    const retry = document.createElement('button');
-    retry.textContent = 'Retry';
-    retry.onclick = loadSessionList;
-    wrap.append(p, retry);
-    listEl.appendChild(wrap);
+  // Three ways to have no sessions, and they need different answers from
+  // you. An empty list used to mean all of them.
+  if (data.error || data.cdp === 'no-daemon') {
+    showListNotice(
+      'Laptop not connected',
+      'The daemon is not reachable from the VPS — it may be starting, or the laptop is offline.',
+      data.error,
+    );
+    return;
+  }
+  if (data.cdp === 'unreachable') {
+    showListNotice(
+      'VS Code is not running',
+      'The daemon is up, but nothing answered on the debug port — VS Code is closed, ' +
+        'restarting, or was started without --remote-debugging-port.',
+      data.cdpError,
+    );
     return;
   }
   if (data.sessions.length === 0) {
-    const p = document.createElement('p');
-    p.className = 'list-empty';
-    p.textContent = 'No open Claude Code sessions right now.';
-    listEl.appendChild(p);
+    showListNotice('No conversations open', 'VS Code is running, with no Claude Code tabs.');
     return;
   }
   for (const s of data.sessions) {
@@ -78,6 +82,28 @@ async function loadSessionList() {
     div.onclick = () => openSession(s.sessionId);
     listEl.appendChild(div);
   }
+}
+
+function showListNotice(heading, detail, raw) {
+  const wrap = document.createElement('div');
+  wrap.className = 'list-error';
+  const h = document.createElement('p');
+  h.className = 'list-notice-heading';
+  h.textContent = heading;
+  const p = document.createElement('p');
+  p.textContent = detail;
+  wrap.append(h, p);
+  if (raw) {
+    const pre = document.createElement('p');
+    pre.className = 'list-notice-raw';
+    pre.textContent = raw;
+    wrap.appendChild(pre);
+  }
+  const retry = document.createElement('button');
+  retry.textContent = 'Retry';
+  retry.onclick = loadSessionList;
+  wrap.appendChild(retry);
+  listEl.appendChild(wrap);
 }
 
 function openSession(sessionId) {

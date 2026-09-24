@@ -347,7 +347,10 @@ async def ws_client_handler(request: web.Request) -> web.WebSocketResponse:
         if mtype == "sessions_result":
             fut = pending_requests.pop(data.get("reqId"), None)
             if fut and not fut.done():
-                fut.set_result(data.get("sessions", []))
+                # The whole payload, not just the list: `cdp` distinguishes
+                # "VS Code did not answer" from "VS Code is open with no
+                # Claude tabs", which are the same empty list.
+                fut.set_result(data)
             continue
 
         if mtype == "state":
@@ -390,7 +393,7 @@ async def ws_client_handler(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
-async def request_list_sessions(timeout: float = 5.0) -> list:
+async def request_list_sessions(timeout: float = 5.0) -> dict:
     req_id = next_req_id()
     fut = asyncio.get_running_loop().create_future()
     pending_requests[req_id] = fut
@@ -450,10 +453,16 @@ async def app_page(request: web.Request) -> web.Response:
 @require_auth
 async def api_sessions(request: web.Request) -> web.Response:
     try:
-        remote_sessions = await request_list_sessions()
+        result = await request_list_sessions()
     except (RuntimeError, asyncio.TimeoutError) as err:
-        return web.json_response({"error": str(err), "sessions": []}, status=503)
-    return web.json_response({"sessions": remote_sessions})
+        # The laptop itself is not reachable. Distinct from the laptop
+        # being up and VS Code not.
+        return web.json_response({"error": str(err), "sessions": [], "cdp": "no-daemon"}, status=503)
+    return web.json_response({
+        "sessions": result.get("sessions", []),
+        "cdp": result.get("cdp", "ok"),
+        "cdpError": result.get("cdpError"),
+    })
 
 
 @require_auth
