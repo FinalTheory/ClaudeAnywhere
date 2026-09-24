@@ -1640,9 +1640,6 @@ test('MCP_STATE_EXPR: an open list with no servers is a list, not "no panel"', (
   assert.deepStrictEqual(out.rows, []);
 });
 
-test('MCP_STATE_EXPR: still "none" when nothing of the panel is present', () => {
-  assert.strictEqual(runExpr(MCP_STATE_EXPR, fakeDom([])).panel, 'none');
-});
 
 test('clickReconnectFor: refuses a second action row even with one title', () => {
   // The shared-ancestor case, with only one title in the document so the

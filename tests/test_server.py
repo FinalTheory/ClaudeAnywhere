@@ -5,6 +5,7 @@ to the VPS on every change, and tests have no business shipping there or
 restarting production on every edit.
 """
 import asyncio
+import itertools
 import json
 import os
 import sys
@@ -163,6 +164,42 @@ class SessionStateTests(IsolatedState):
         st = self.make(["dup", "x", "dup", "y"])
         st.apply_resync(["dup", "z"])
         self.assertEqual(st.turns, ["dup", "x", "dup", "z"], "splices at the last match")
+
+    def test_resync_tie_break_prefers_the_later_of_two_equal_overlaps(self):
+        """The case above does not reach the tie-break: `earliest` leaves
+        only one candidate position, so the bound satisfies it and
+        `run >= best_run` does no work. Here two positions score the same
+        run and the earlier one deletes a stored turn — F2.1's direction."""
+        st = self.make(["A", "A"])
+        st.apply_resync(["A", "B"])
+        self.assertEqual(st.turns, ["A", "A", "B"], "the later overlap keeps both stored turns")
+
+    def test_resync_tie_break_over_every_repeat_pattern(self):
+        """The smallest case above is one of many. Enumerated, because the
+        brute-force invariants nearby cannot see this: preferring the
+        earlier position loses a turn by replacement, so the result is
+        still the right length and still ends with the tail."""
+        alphabet = "AB"
+        disagreements = 0
+        for stored_len in range(1, 5):
+            for tail_len in range(1, 4):
+                for stored in itertools.product(alphabet, repeat=stored_len):
+                    for tail in itertools.product(alphabet, repeat=tail_len):
+                        st = self.make(list(stored))
+                        st.apply_resync(list(tail))
+                        # The invariant the tie-break exists to keep: a
+                        # resync never shortens the stored history.
+                        self.assertGreaterEqual(
+                            len(st.turns), stored_len,
+                            f"stored={stored} tail={tail} lost a turn",
+                        )
+                        self.assertEqual(
+                            st.turns[-len(tail):], list(tail),
+                            f"stored={stored} tail={tail} does not end with the tail",
+                        )
+                        if len(st.turns) > stored_len:
+                            disagreements += 1
+        self.assertGreater(disagreements, 0, "the enumeration must reach the growing case")
 
     def test_resync_with_no_turns_is_a_noop(self):
         st = self.make(["a"])
@@ -799,6 +836,36 @@ class ActionRouteTests(AioHTTPTestCase, IsolatedState):
             await asyncio.wait_for(a.receive_json(), timeout=0.3)
         await a.close()
         await b.close()
+        await daemon.close()
+
+    async def test_the_daemons_error_and_recovery_frames_reach_the_phone(self):
+        """The phone proving it renders these says nothing about the server
+        forwarding them, and they are the frames whose only purpose is to
+        reach a person: the once-per-outage attach failure, the DOM-mismatch
+        warning, and the recovery that retracts them."""
+        daemon = await self.client.ws_connect("/ws/client")
+        await daemon.send_json({"type": "hello", "token": TOKEN})
+        await asyncio.wait_for(daemon.receive_json(), timeout=5)
+
+        phone = await self.client.ws_connect("/ws/phone/s1", headers=AUTH_HEADER)
+        await asyncio.wait_for(phone.receive_json(), timeout=5)  # initial
+
+        await daemon.send_json(
+            {"type": "error", "sessionId": "s1", "message": 'No target matched "x"'}
+        )
+        got = await asyncio.wait_for(phone.receive_json(), timeout=5)
+        self.assertEqual(got["type"], "error")
+        self.assertEqual(got["message"], 'No target matched "x"')
+
+        await daemon.send_json({"type": "recovered", "sessionId": "s1"})
+        got = await asyncio.wait_for(phone.receive_json(), timeout=5)
+        self.assertEqual(got["type"], "recovered")
+
+        # And a frame for a session nobody is watching is not an error.
+        await daemon.send_json({"type": "error", "sessionId": "nobody", "message": "x"})
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(phone.receive_json(), timeout=0.3)
+        await phone.close()
         await daemon.close()
 
     async def test_the_phone_is_told_when_the_laptop_goes_away(self):
