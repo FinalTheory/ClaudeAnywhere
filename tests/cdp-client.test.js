@@ -221,3 +221,27 @@ test('send: sending on an already-dead socket rejects instead of hanging', async
   assert.match((await settle(send('Runtime.evaluate', {}))).message, /not open/);
   assert.strictEqual(ws.count('message'), 0, 'and does not leak its listener');
 });
+
+test('send: a socket that stays open and never answers still rejects', async () => {
+  // The other half of the same silence. Closing covers the socket dying;
+  // this covers the target wedging with the connection intact, which
+  // produces an identical symptom — a poll loop that never reschedules
+  // and a session busy for the life of the daemon.
+  const ws = fakeSocket();
+  const send = makeSend(ws, 30);
+  assert.match((await settle(send('Runtime.evaluate', {}))).message, /did not answer within 30ms/);
+});
+
+test('send: a reply cancels its own deadline', async () => {
+  // A timer left running past the reply fires into a deleted entry. It
+  // must not reject a promise that already resolved, nor keep the process
+  // awake between polls.
+  const ws = fakeSocket();
+  const send = makeSend(ws, 20);
+  const p = send('Runtime.evaluate', {});
+  const { id } = JSON.parse(ws.sent[0]);
+  ws.fire('message', { data: JSON.stringify({ id, result: { value: 1 } }) });
+  assert.deepStrictEqual(await p, { value: 1 });
+  await new Promise((r) => setTimeout(r, 40));
+  assert.strictEqual(ws.count('message'), 0, 'no listener outlives the reply');
+});

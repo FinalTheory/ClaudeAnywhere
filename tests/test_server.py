@@ -727,6 +727,78 @@ class ActionRouteTests(AioHTTPTestCase, IsolatedState):
         self.assertEqual(body["sessionId"], "new-1")
         await ws.close()
 
+    async def test_a_slow_daemon_is_not_reported_as_an_absent_one(self):
+        """`str(asyncio.TimeoutError())` is the empty string, so a timeout
+        reached the phone with no reason and rendered as "Laptop not
+        connected" — which sends the author to check the wrong thing."""
+        self.assertEqual(str(asyncio.TimeoutError()), "")
+        slow = server.describe_daemon_failure(asyncio.TimeoutError())
+        absent = server.describe_daemon_failure(RuntimeError("daemon not connected"))
+        self.assertIn("did not answer", slow)
+        self.assertNotEqual(slow, absent)
+        # And an exception that carries nothing still says something.
+        self.assertTrue(server.describe_daemon_failure(RuntimeError()))
+
+    async def test_submit_ack_goes_to_the_tab_that_submitted(self):
+        """submit_ack carries nothing to correlate on. Broadcast, it makes a
+        second tab clear its own pending send, report "send failed" and hand
+        the text back — so the author sends the same message twice."""
+        daemon = await self.client.ws_connect("/ws/client")
+        await daemon.send_json({"type": "hello", "token": TOKEN})
+        await asyncio.wait_for(daemon.receive_json(), timeout=5)
+
+        a = await self.client.ws_connect("/ws/phone/s1", headers=AUTH_HEADER)
+        await asyncio.wait_for(a.receive_json(), timeout=5)  # initial
+        b = await self.client.ws_connect("/ws/phone/s1", headers=AUTH_HEADER)
+        await asyncio.wait_for(b.receive_json(), timeout=5)
+
+        await b.send_json({"type": "submit", "text": "from b"})
+        # Drain the daemon's view of it so ordering is unambiguous.
+        while True:
+            frame = await asyncio.wait_for(daemon.receive_json(), timeout=5)
+            if frame.get("type") == "submit":
+                break
+        await daemon.send_json(
+            {"type": "submit_ack", "sessionId": "s1", "ok": False, "error": "busy"}
+        )
+
+        got = await asyncio.wait_for(b.receive_json(), timeout=5)
+        self.assertEqual(got["type"], "submit_ack")
+        self.assertFalse(got["ok"])
+        # A must not have been told anything about a message it did not send.
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(a.receive_json(), timeout=0.3)
+        await a.close()
+        await b.close()
+        await daemon.close()
+
+    async def test_the_phone_is_told_when_the_laptop_goes_away(self):
+        """The phone's own liveness ping only proves the VPS is up. Without
+        this frame the transcript simply stops moving and nothing says why."""
+        daemon = await self.client.ws_connect("/ws/client")
+        await daemon.send_json({"type": "hello", "token": TOKEN})
+        await asyncio.wait_for(daemon.receive_json(), timeout=5)
+
+        phone = await self.client.ws_connect("/ws/phone/s1", headers=AUTH_HEADER)
+        await asyncio.wait_for(phone.receive_json(), timeout=5)  # initial
+
+        await daemon.close()
+        frame = await asyncio.wait_for(phone.receive_json(), timeout=5)
+        self.assertEqual(frame["type"], "laptop")
+        self.assertFalse(frame["connected"])
+
+        # And when it comes back.
+        again = await self.client.ws_connect("/ws/client")
+        await again.send_json({"type": "hello", "token": TOKEN})
+        await asyncio.wait_for(again.receive_json(), timeout=5)
+        while True:
+            frame = await asyncio.wait_for(phone.receive_json(), timeout=5)
+            if frame.get("type") == "laptop":
+                break
+        self.assertTrue(frame["connected"])
+        await phone.close()
+        await again.close()
+
     async def test_two_actions_in_flight_each_get_their_own_answer(self):
         """reqId is what routes a reply, and with one request outstanding
         any pop at all looks correct. Replying out of order is the only

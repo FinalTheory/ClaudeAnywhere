@@ -1,4 +1,10 @@
 // Minimal CDP JSON-RPC client over the native WebSocket global (Node >= 22).
+//
+// Generous, because it is not a latency budget: it exists so a request can
+// never wait forever, and the poll loop that consumes these runs every
+// 1.5s. A real Runtime.evaluate against a live webview returns in
+// milliseconds; anything near this number means the target is wedged.
+const REQUEST_TIMEOUT_MS = 15000;
 // Shared by read-transcript.js and send-prompt.js.
 
 async function findTarget(port, match) {
@@ -28,7 +34,7 @@ async function connect(target) {
 // Separate from connect() so the settle-on-close behaviour below can be
 // exercised without standing up a WebSocket server in a suite that has no
 // dependencies to do it with.
-function makeSend(ws) {
+function makeSend(ws, timeoutMs = REQUEST_TIMEOUT_MS) {
   let nextId = 1;
   // Every request in flight, so the socket dying can settle them. A reply
   // is the only thing that resolved a send, and a debug socket that goes
@@ -46,6 +52,7 @@ function makeSend(ws) {
     const err = new Error(reason);
     for (const [, entry] of pending) {
       ws.removeEventListener('message', entry.onMessage);
+      clearTimeout(entry.timer);
       entry.reject(err);
     }
     pending.clear();
@@ -56,15 +63,26 @@ function makeSend(ws) {
   function send(method, params = {}) {
     const id = nextId++;
     return new Promise((resolve, reject) => {
+      // Closing the socket covers the socket dying. It does not cover the
+      // other way a reply never comes: the socket stays open and the
+      // target stops answering — a wedged renderer, a target detached
+      // without a close. The symptom is identical and just as silent, so
+      // the deadline is on the request rather than on the connection.
+      const timer = setTimeout(() => {
+        ws.removeEventListener('message', onMessage);
+        pending.delete(id);
+        reject(new Error(`CDP ${method} did not answer within ${timeoutMs}ms`));
+      }, timeoutMs);
       const onMessage = (ev) => {
         const msg = JSON.parse(ev.data);
         if (msg.id !== id) return;
         ws.removeEventListener('message', onMessage);
+        clearTimeout(timer);
         pending.delete(id);
         if (msg.error) reject(new Error(msg.error.message));
         else resolve(msg.result);
       };
-      pending.set(id, { reject, onMessage });
+      pending.set(id, { reject, onMessage, timer });
       ws.addEventListener('message', onMessage);
       try {
         ws.send(JSON.stringify({ id, method, params }));
@@ -72,6 +90,7 @@ function makeSend(ws) {
         // A send on an already-closed socket throws synchronously, before
         // any close event this listener would see.
         ws.removeEventListener('message', onMessage);
+        clearTimeout(timer);
         pending.delete(id);
         reject(err);
       }

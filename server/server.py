@@ -26,6 +26,7 @@ import hmac
 import json
 import os
 import time
+from collections import deque
 from pathlib import Path
 
 from aiohttp import web, WSMsgType
@@ -83,7 +84,9 @@ def _verify_cookie(value: str) -> bool:
 # thing that actually matters (bounded memory/disk) falls out of it for free.
 
 class SessionState:
-    __slots__ = ("session_id", "turns", "running", "last_seen", "phone_sockets")
+    __slots__ = (
+        "session_id", "turns", "running", "last_seen", "phone_sockets", "awaiting_ack"
+    )
 
     def __init__(self, session_id: str):
         self.session_id = session_id
@@ -91,6 +94,13 @@ class SessionState:
         self.running = None
         self.last_seen = time.time()
         self.phone_sockets: set[web.WebSocketResponse] = set()
+        # Sockets that submitted and have not been answered, oldest first.
+        # submit_ack carries nothing to correlate on, so broadcasting it
+        # makes a second tab disown its own message: it clears its pending
+        # send, reports "send failed" and hands the text back, and the
+        # obvious next move is to send it again. The daemon answers submits
+        # in the order it receives them, so order is enough.
+        self.awaiting_ack: "deque[web.WebSocketResponse]" = deque()
 
     def path(self) -> Path:
         return DATA_DIR / f"{self.session_id}.json"
@@ -298,6 +308,16 @@ def next_req_id() -> int:
     return _next_req_id
 
 
+async def broadcast_all(payload: dict):
+    """Tell every phone watching anything. Used for the laptop appearing and
+    disappearing, which is not a property of any one session: the phone's own
+    liveness ping only proves the VPS is up, so without this the transcript
+    just stops moving and nothing says why."""
+    for st in list(sessions.values()):
+        if st.phone_sockets:
+            await broadcast(st, payload)
+
+
 async def send_to_client(obj: dict) -> bool:
     if client_ws is None or client_ws.closed or not client_authed:
         return False
@@ -336,6 +356,7 @@ async def ws_client_handler(request: web.Request) -> web.WebSocketResponse:
                 for st in sessions.values():
                     if st.phone_sockets:
                         await ws.send_json({"type": "subscribe", "sessionId": st.session_id})
+                await broadcast_all({"type": "laptop", "connected": True})
             else:
                 await ws.send_json({"type": "auth_failed"})
                 await ws.close()
@@ -398,7 +419,27 @@ async def ws_client_handler(request: web.Request) -> web.WebSocketResponse:
             await broadcast(st, {"type": "resync", "turns": window_turns, "startIndex": start_index})
             continue
 
-        if mtype in ("submit_ack", "error"):
+        if mtype == "submit_ack":
+            st = sessions.get(data.get("sessionId", ""))
+            if st:
+                target = None
+                while st.awaiting_ack:
+                    candidate = st.awaiting_ack.popleft()
+                    if not candidate.closed:
+                        target = candidate
+                        break
+                if target is not None:
+                    try:
+                        await target.send_json(data)
+                    except Exception:
+                        st.phone_sockets.discard(target)
+                else:
+                    # The tab that asked is gone. Everyone else is better
+                    # off hearing it than nobody being told at all.
+                    await broadcast(st, data)
+            continue
+
+        if mtype == "error":
             st = sessions.get(data.get("sessionId", ""))
             if st:
                 await broadcast(st, data)
@@ -407,7 +448,18 @@ async def ws_client_handler(request: web.Request) -> web.WebSocketResponse:
     if client_ws is ws:
         client_ws = None
         client_authed = False
+        await broadcast_all({"type": "laptop", "connected": False})
     return ws
+
+
+def describe_daemon_failure(err: Exception) -> str:
+    """A timeout and an absent daemon are different problems with different
+    fixes, and `str(asyncio.TimeoutError())` is the empty string — so the
+    timeout arrived at the phone with no reason attached and was rendered as
+    "Laptop not connected", which is the wrong thing to go and check."""
+    if isinstance(err, asyncio.TimeoutError):
+        return "the laptop is connected but did not answer in time"
+    return str(err) or "the laptop is not connected"
 
 
 async def request_action(payload: dict, timeout: float) -> dict:
@@ -492,7 +544,9 @@ async def api_sessions(request: web.Request) -> web.Response:
     except (RuntimeError, asyncio.TimeoutError) as err:
         # The laptop itself is not reachable. Distinct from the laptop
         # being up and VS Code not.
-        return web.json_response({"error": str(err), "sessions": [], "cdp": "no-daemon"}, status=503)
+        return web.json_response(
+            {"error": describe_daemon_failure(err), "sessions": [], "cdp": "no-daemon"}, status=503
+        )
     return web.json_response({
         "sessions": result.get("sessions", []),
         "cdp": result.get("cdp", "ok"),
@@ -530,7 +584,7 @@ async def _action_route(request: web.Request, payload_from, timeout: float) -> w
     try:
         result = await request_action(payload_from(body), timeout)
     except (RuntimeError, asyncio.TimeoutError) as err:
-        return web.json_response({"ok": False, "error": str(err)}, status=503)
+        return web.json_response({"ok": False, "error": describe_daemon_failure(err)}, status=503)
     # 200 even for ok:false — the laptop answered, and what it said is the
     # useful part. A 5xx here would read as "the VPS is broken".
     return web.json_response(result)
@@ -597,10 +651,17 @@ async def ws_phone_handler(request: web.Request) -> web.WebSocketResponse:
                 await ws.send_json({"type": "pong"})
                 continue
             if data.get("type") == "submit":
+                st.awaiting_ack.append(ws)
                 ok = await send_to_client(
                     {"type": "submit", "sessionId": session_id, "text": data.get("text", "")}
                 )
                 if not ok:
+                    # Answered here, so it must not also consume the next
+                    # ack the daemon sends for somebody else's submit.
+                    try:
+                        st.awaiting_ack.remove(ws)
+                    except ValueError:
+                        pass
                     # send_to_client returns False silently if the daemon
                     # isn't connected right now (e.g. mid-restart) — without
                     # this, that's indistinguishable from "sent fine, still
@@ -615,6 +676,8 @@ async def ws_phone_handler(request: web.Request) -> web.WebSocketResponse:
                     })
     finally:
         st.phone_sockets.discard(ws)
+        while ws in st.awaiting_ack:
+            st.awaiting_ack.remove(ws)
         if not st.phone_sockets:
             await send_to_client({"type": "unsubscribe", "sessionId": session_id})
 

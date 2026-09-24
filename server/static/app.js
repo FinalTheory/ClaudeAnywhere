@@ -41,7 +41,13 @@ let lastInboundAt = 0;
 // Text typed while the socket was not trustworthy, sent once a fresh one
 // opens. Only ever set on a path where the send provably did not happen,
 // so flushing it cannot duplicate a message.
-let queuedSend = null;
+// Messages typed while the socket was stale, each tagged with the session
+// it was typed into. A bare string here goes out on whichever socket opens
+// next: type into one conversation, tap Back, open another, and the prompt
+// lands in the second one and is acked ok. An array rather than one slot
+// because two sends during a single outage otherwise overwrite each other
+// with nothing said.
+let queuedSends = [];
 const PING_EVERY_MS = 20000;
 // Older than this and the send path stops trusting the socket. Must
 // exceed PING_EVERY_MS or a healthy connection would look stale between
@@ -341,12 +347,14 @@ function connectPhoneWs(sessionId, delay) {
     setTimeout(() => connectPhoneWs(sessionId, nextDelay), delay || 500);
   };
   ws.onopen = () => {
+    // Orphaned sockets must not flush the queue either: submitText writes
+    // to the current `ws`, so a late open on a replaced socket would send
+    // into whatever conversation is on screen now.
+    if (gen !== wsGeneration || sessionId !== currentSessionId) return;
     lastInboundAt = Date.now();
-    if (queuedSend) {
-      const text = queuedSend;
-      queuedSend = null;
-      submitText(text);
-    }
+    const mine = queuedSends.filter((q) => q.sessionId === sessionId);
+    queuedSends = queuedSends.filter((q) => q.sessionId !== sessionId);
+    for (const q of mine) submitText(q.text);
   };
   ws.onmessage = (ev) => {
     lastInboundAt = Date.now();
@@ -381,6 +389,18 @@ function connectPhoneWs(sessionId, delay) {
       scrollToBottom(stick);
     } else if (msg.type === 'state') {
       setStatus(msg.running);
+    } else if (msg.type === 'error') {
+      // The daemon's own tells: the attach failure it reports once per
+      // outage, and the DOM-mismatch warning whose entire purpose is to
+      // reach a person. Dropped, they leave the transcript frozen on
+      // "Running..." with nothing to explain it. No `state` frame follows
+      // an outage, so this stays on screen until the session recovers.
+      setStatus(null, msg.message);
+    } else if (msg.type === 'laptop') {
+      // The VPS lost or regained the daemon. The phone's own liveness ping
+      // only proves the VPS is up, so nothing else distinguishes a laptop
+      // asleep from a conversation that has gone quiet.
+      setStatus(null, msg.connected ? null : 'Laptop disconnected — waiting for it to come back');
     } else if (msg.type === 'submit_ack') {
       if (pendingSend) clearTimeout(pendingSend.timeoutId);
       if (!msg.ok) {
@@ -709,7 +729,7 @@ sendForm.onsubmit = (e) => {
   // reconnect had finished. Do the reconnect first instead of spending
   // the user's message discovering it.
   if (!socketLooksAlive()) {
-    queuedSend = text;
+    queuedSends.push({ sessionId: currentSessionId, text });
     promptInput.value = '';
     promptInput.style.height = 'auto';
     setStatus(null, 'Reconnecting — your message will go as soon as it is back');
