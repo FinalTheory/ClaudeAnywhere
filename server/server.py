@@ -524,6 +524,13 @@ async def ws_phone_handler(request: web.Request) -> web.WebSocketResponse:
                 data = json.loads(msg.data)
             except json.JSONDecodeError:
                 continue
+            if data.get("type") == "ping":
+                # Same reason the daemon has one: iOS suspends a
+                # backgrounded tab and the socket can come back OPEN but
+                # dead, with protocol-level ping/pong handled below the
+                # browser's WebSocket API where page code cannot see it.
+                await ws.send_json({"type": "pong"})
+                continue
             if data.get("type") == "submit":
                 ok = await send_to_client(
                     {"type": "submit", "sessionId": session_id, "text": data.get("text", "")}

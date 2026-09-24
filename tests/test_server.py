@@ -651,5 +651,38 @@ class PingTests(AioHTTPTestCase, IsolatedState):
             await asyncio.wait_for(ws.receive_json(), timeout=0.3)
         await ws.close()
 
+
+class PhonePingTests(AioHTTPTestCase, IsolatedState):
+    """The phone needs the same liveness answer the daemon does: iOS
+    suspends a backgrounded tab and the socket comes back reporting OPEN
+    for a connection that is gone, which is why the first message after an
+    idle period used to fail and the second one worked."""
+
+    async def get_application(self):
+        return server.make_app()
+
+    def setUp(self):
+        IsolatedState.setUp(self)
+        AioHTTPTestCase.setUp(self)
+
+    async def test_phone_ping_is_answered_with_pong(self):
+        ws = await self.client.ws_connect("/ws/phone/s1", headers=AUTH_HEADER)
+        await asyncio.wait_for(ws.receive_json(), timeout=5)  # initial
+        await ws.send_json({"type": "ping"})
+        self.assertEqual(
+            await asyncio.wait_for(ws.receive_json(), timeout=5), {"type": "pong"}
+        )
+        await ws.close()
+
+    async def test_a_ping_does_not_disturb_the_session(self):
+        st = server.get_session("s1")
+        st.turns = ["<p>a</p>"]
+        ws = await self.client.ws_connect("/ws/phone/s1", headers=AUTH_HEADER)
+        await asyncio.wait_for(ws.receive_json(), timeout=5)
+        await ws.send_json({"type": "ping"})
+        await asyncio.wait_for(ws.receive_json(), timeout=5)
+        self.assertEqual(server.sessions["s1"].turns, ["<p>a</p>"])
+        await ws.close()
+
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,7 @@ server/static/claude-webview.css
 /probe-titles.js
 /probe-titles2.js
 /probe-titles3.js
+/probe-buttons.js
 /result.txt
 /scan-frames.js
 /send-prompt.js

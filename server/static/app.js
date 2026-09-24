@@ -25,6 +25,24 @@ let hasMore = true;
 let pendingSend = null; // { text, timeoutId }
 const SUBMIT_ACK_TIMEOUT_MS = 5000;
 
+// When the VPS last said anything on this socket. readyState is not
+// evidence: iOS suspends a backgrounded tab, and the socket can come back
+// reporting OPEN while the connection underneath is gone — send() then
+// succeeds into nothing. The browser answers protocol-level pings below
+// the WebSocket API without telling page code, so an application ping is
+// the only observable.
+let lastInboundAt = 0;
+// Text typed while the socket was not trustworthy, sent once a fresh one
+// opens. Only ever set on a path where the send provably did not happen,
+// so flushing it cannot duplicate a message.
+let queuedSend = null;
+const PING_EVERY_MS = 20000;
+// Older than this and the send path stops trusting the socket. Must
+// exceed PING_EVERY_MS or a healthy connection would look stale between
+// pongs.
+const STALE_AFTER_MS = 30000;
+const DEAD_AFTER_MS = 60000;
+
 async function loadSessionList() {
   listEl.innerHTML = '<div class="list-header">Sessions</div><div class="list-loading">Loading…</div>';
   const res = await fetch('/api/sessions');
@@ -133,6 +151,16 @@ let wsGeneration = 0;
 function connectPhoneWs(sessionId, delay) {
   if (sessionId !== currentSessionId) return; // user navigated away meanwhile
   const gen = ++wsGeneration;
+  // Close the one being replaced. Its handlers are already orphaned by the
+  // generation bump, but leaving it open holds a second phone socket in
+  // the server's subscriber set for this session.
+  if (ws) {
+    try {
+      ws.close();
+    } catch (e) {
+      // a dead socket may refuse even this
+    }
+  }
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws/phone/${sessionId}`);
   ws.onclose = () => {
@@ -143,8 +171,18 @@ function connectPhoneWs(sessionId, delay) {
     const nextDelay = Math.min((delay || 500) * 2, 8000);
     setTimeout(() => connectPhoneWs(sessionId, nextDelay), delay || 500);
   };
+  ws.onopen = () => {
+    lastInboundAt = Date.now();
+    if (queuedSend) {
+      const text = queuedSend;
+      queuedSend = null;
+      submitText(text);
+    }
+  };
   ws.onmessage = (ev) => {
+    lastInboundAt = Date.now();
     const msg = JSON.parse(ev.data);
+    if (msg.type === 'pong') return; // liveness only; the timestamp is the payload
     // Capture this BEFORE inserting anything — afterwards the container has
     // already grown and every position reads as "not at the bottom".
     const stick = atBottom();
@@ -458,8 +496,14 @@ async function loadOlder() {
 // view just stops updating. Dial straight away instead of waiting.
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible' || !currentSessionId) return;
-  if (ws && ws.readyState === WebSocket.OPEN) return;
-  connectPhoneWs(currentSessionId);
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    connectPhoneWs(currentSessionId);
+    return;
+  }
+  // OPEN after a suspend proves nothing. Ask, and let the deadline above
+  // decide — but do it now rather than up to 5s from now, because the
+  // next thing to happen is usually the user sending something.
+  ws.send(JSON.stringify({ type: 'ping' }));
 });
 
 backBtn.onclick = () => {
@@ -479,20 +523,35 @@ promptInput.addEventListener('input', () => {
   promptInput.style.height = `${promptInput.scrollHeight}px`;
 });
 
+// Whether this socket has shown any sign of life recently enough to send
+// on. OPEN alone is not enough — that is the state a suspended-then-
+// resumed iOS tab reports for a connection that no longer exists.
+function socketLooksAlive() {
+  return ws && ws.readyState === WebSocket.OPEN && Date.now() - lastInboundAt < STALE_AFTER_MS;
+}
+
 sendForm.onsubmit = (e) => {
   e.preventDefault();
   const text = promptInput.value.trim();
   if (!text) return;
-  // The VPS restarts on every deploy, which drops this socket for a moment
-  // (see connectPhoneWs's reconnect logic). Without this check, a send
-  // during that gap either throws (ws.send on a non-OPEN socket) and gets
-  // silently swallowed by the browser, or the text is cleared here while
-  // the underlying send never actually reaches the server — either way,
-  // "looks sent" but never arrives, with no indication anything went wrong.
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    setStatus(null, 'Not connected — reconnecting, try again in a moment');
+  // Come back to the tab after a while and the socket is usually stale:
+  // the send lands nowhere, the ack never arrives, and the first message
+  // after every idle period failed while the second worked — by then the
+  // reconnect had finished. Do the reconnect first instead of spending
+  // the user's message discovering it.
+  if (!socketLooksAlive()) {
+    queuedSend = text;
+    promptInput.value = '';
+    promptInput.style.height = 'auto';
+    setStatus(null, 'Reconnecting — your message will go as soon as it is back');
+    connectPhoneWs(currentSessionId);
     return;
   }
+  submitText(text);
+};
+
+// The part that assumes a working socket, so the queue can reuse it.
+function submitText(text) {
   ws.send(JSON.stringify({ type: 'submit', text }));
   promptInput.value = '';
   promptInput.style.height = 'auto';
@@ -515,6 +574,22 @@ sendForm.onsubmit = (e) => {
       pendingSend = null;
     }, SUBMIT_ACK_TIMEOUT_MS),
   };
-};
+}
+
+// Liveness. Ping on a cadence well under the deadline so one lost packet
+// is not a dead connection, and replace the socket when the VPS has been
+// silent past it. Deliberately no auto-retry of an unacknowledged send:
+// a lost ack and a lost send are indistinguishable from here, and sending
+// the same prompt twice is worse than saying it may not have gone.
+setInterval(() => {
+  if (document.visibilityState !== 'visible' || !currentSessionId) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return; // the backoff loop owns this
+  const quiet = Date.now() - lastInboundAt;
+  if (quiet > DEAD_AFTER_MS) {
+    connectPhoneWs(currentSessionId);
+  } else if (quiet > PING_EVERY_MS) {
+    ws.send(JSON.stringify({ type: 'ping' }));
+  }
+}, 5000);
 
 loadSessionList();
