@@ -196,15 +196,25 @@ function renderMcp(out) {
     btn.onclick = async () => {
       btn.disabled = true;
       btn.textContent = 'Reconnecting…';
-      const res = await postJson('/api/mcp/reconnect', { serverName: srv.name });
-      btn.textContent = 'Reconnect';
-      btn.disabled = false;
-      if (res.ok) {
-        mcpListEl.hidden = false;
-        refreshMcp();
-      } else {
-        status.textContent = res.error || 'failed';
+      // Without the finally, a rejected fetch, a non-JSON proxy reply or
+      // an expired-auth redirect escapes the handler and leaves the
+      // button disabled on "Reconnecting…" with nothing said — the exact
+      // silent stall this is meant to fix.
+      try {
+        const res = await postJson('/api/mcp/reconnect', { serverName: srv.name });
+        if (res.ok) {
+          mcpListEl.hidden = false;
+          refreshMcp();
+        } else {
+          status.textContent = res.error || 'failed';
+          status.className = 'mcp-status bad';
+        }
+      } catch (err) {
+        status.textContent = err.message || 'the request did not complete';
         status.className = 'mcp-status bad';
+      } finally {
+        btn.textContent = 'Reconnect';
+        btn.disabled = false;
       }
     };
     const text = document.createElement('div');

@@ -258,12 +258,20 @@ function clickServerRow(name) {
 (function () {
   const wanted = ${JSON.stringify(name)};
   const rows = [...document.querySelectorAll('[class*="serverItem_"]')];
-  const hit = rows.find((el) => {
+  const nameOf = (el) => {
     const n = el.querySelector('[class*="serverName_"]');
-    return n && (n.textContent || '').trim() === wanted;
-  });
-  if (!hit) return { ok: false, reason: 'no such server', seen: rows.map((el) => (el.querySelector('[class*="serverName_"]')?.textContent || '').trim()) };
-  hit.click();
+    return n ? (n.textContent || '').trim() : null;
+  };
+  const matches = rows.filter((el) => nameOf(el) === wanted);
+  if (!matches.length) return { ok: false, reason: 'no such server', seen: rows.map(nameOf) };
+  // The name is trimmed for display and carried back as the request, so
+  // two rows differing only in surrounding whitespace arrive here
+  // indistinguishable. Picking the first would reconnect whichever one
+  // happened to render earlier, not the one that was tapped.
+  if (matches.length > 1) {
+    return { ok: false, reason: 'more than one server is called ' + JSON.stringify(wanted) + ' — cannot tell them apart' };
+  }
+  matches[0].click();
   return { ok: true };
 })()
 `;
@@ -276,14 +284,24 @@ function clickReconnectFor(name) {
   return `
 (function () {
   const wanted = ${JSON.stringify(name)};
-  const title = document.querySelector('[class*="detailTitle_"]');
+  const titles = [...document.querySelectorAll('[class*="detailTitle_"]')];
+  if (titles.length > 1) return { ok: false, reason: 'more than one detail view is mounted' };
+  const title = titles[0];
   const shown = title && (title.textContent || '').trim();
   if (shown !== wanted) return { ok: false, reason: 'detail view shows ' + JSON.stringify(shown) + ', not ' + JSON.stringify(wanted) };
-  const btn = [...document.querySelectorAll('[class*="actionButton_"]')]
-    .find((el) => (el.textContent || '').trim() === 'Reconnect');
-  if (!btn) return { ok: false, reason: 'no Reconnect button in this detail view' };
-  if (btn.disabled) return { ok: false, reason: 'already reconnecting' };
-  btn.click();
+  // Scope the button to the panel the title belongs to. Verifying a
+  // document-wide title and then clicking a document-wide button checks
+  // one element and acts on another: any earlier mounted section with an
+  // exact-text Reconnect satisfies both, and they need share no ancestor.
+  let panel = title;
+  while (panel && !panel.querySelector('[class*="detailActions_"]')) panel = panel.parentElement;
+  if (!panel) return { ok: false, reason: 'found the title but not the actions it belongs to' };
+  const btns = [...panel.querySelectorAll('[class*="actionButton_"]')]
+    .filter((el) => (el.textContent || '').trim() === 'Reconnect');
+  if (!btns.length) return { ok: false, reason: 'no Reconnect button in this detail view' };
+  if (btns.length > 1) return { ok: false, reason: 'several Reconnect buttons in one detail view' };
+  if (btns[0].disabled) return { ok: false, reason: 'already reconnecting' };
+  btns[0].click();
   return { ok: true };
 })()
 `;
@@ -593,7 +611,12 @@ class SessionWatcher {
         await dispatchEnter(this.client, 0);
       }
     }
-    await dispatchEnter(this.client, CMD_MODIFIER);
+    try {
+      await dispatchEnter(this.client, CMD_MODIFIER);
+    } catch (err) {
+      // keyDown may already have submitted; the caller must not retry.
+      return { ok: false, dispatched: true, reason: `submit keystroke failed: ${err.message}` };
+    }
     return { ok: true };
   }
 
@@ -642,7 +665,15 @@ const MENU_STATE_EXPR = `
     return ((lab || el).textContent || '').trim();
   });
   const box = [...document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')].pop();
-  return { items, draft: box ? (box.value !== undefined ? box.value : box.textContent) || '' : null };
+  if (!box) return { items, draft: null, structured: false };
+  const draft = (box.value !== undefined ? box.value : box.textContent) || '';
+  // textContent flattens a rich editor: <p>a</p><p>b</p> reads as "ab",
+  // and putting that back as plain text would silently rewrite what the
+  // author had typed. Anything that is not one plain line is not
+  // something this can promise to restore.
+  const html = box.innerHTML !== undefined ? box.innerHTML : '';
+  const structured = /[\\r\\n]/.test(draft) || /<(p|div|br|ul|ol|li|pre|code)[ >]/i.test(html);
+  return { items, draft, structured };
 })()
 `;
 
@@ -674,10 +705,15 @@ const CLICK_MCP_COMMAND_EXPR = `
 const CLEAR_COMPOSER_EXPR = `
 (function () {
   const box = [...document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')].pop();
-  if (!box) return { ok: false };
+  if (!box) return { ok: false, reason: 'no composer' };
   box.focus();
-  document.execCommand('selectAll');
-  document.execCommand('delete');
+  // execCommand returns false when refused. Discarding that was how a
+  // "cleared" composer could still hold text, so the next insertion
+  // appended to it instead of replacing it.
+  if (!document.execCommand('selectAll')) return { ok: false, reason: 'selectAll refused' };
+  if (!document.execCommand('delete')) return { ok: false, reason: 'delete refused' };
+  const left = (box.value !== undefined ? box.value : box.textContent) || '';
+  if (left.trim()) return { ok: false, reason: 'composer still holds text after clearing' };
   return { ok: true };
 })()
 `;
@@ -705,31 +741,64 @@ async function openMcpPanel(run) {
   // No Enter at any point: Enter sends "/mcp" as a message instead of
   // opening the panel.
   const before = await run(MENU_STATE_EXPR);
-  const draft = before.draft || '';
-  if (draft) await run(CLEAR_COMPOSER_EXPR);
-  await run(injectExpr('/mcp'));
+  if (before.draft === null) return { ok: false, error: 'no composer in this session' };
+  const draft = before.draft;
 
-  const menu = await waitFor(
-    run,
-    MENU_STATE_EXPR,
-    (st) => st.items.some((label) => label.trim().replace(/^\//, '').toLowerCase().startsWith('mcp')),
-    { timeoutMs: 5000 },
-  );
-  if (!menu.items.length) {
-    await run(CLEAR_COMPOSER_EXPR);
-    if (draft) await run(injectExpr(draft));
-    return { ok: false, error: 'typing /mcp opened no command menu' };
-  }
-
-  const picked = await run(CLICK_MCP_COMMAND_EXPR);
-  // Either way the composer goes back to how it was found.
-  await run(CLEAR_COMPOSER_EXPR);
-  if (draft) await run(injectExpr(draft));
-  if (!picked.ok) {
+  // Refuse rather than mangle. A multi-line or rich draft cannot be put
+  // back from the flattened text this can read, and quietly rewriting
+  // what someone was typing on the laptop is worse than not running.
+  if (draft && before.structured) {
     return {
       ok: false,
-      error: `${picked.reason}${picked.seen && picked.seen.length ? ` (menu showed: ${picked.seen.join(', ')})` : ''}`,
+      error: 'the laptop composer holds a multi-line draft — clear or send it first, ' +
+        'since this cannot put it back exactly',
     };
+  }
+
+  let mutated = false;
+  const restore = async () => {
+    if (!mutated) return;
+    await run(CLEAR_COMPOSER_EXPR).catch(() => {});
+    if (draft) await run(injectExpr(draft)).catch(() => {});
+  };
+
+  try {
+    if (draft) {
+      const cleared = await run(CLEAR_COMPOSER_EXPR);
+      if (!cleared.ok) return { ok: false, error: `could not clear the composer: ${cleared.reason}` };
+    }
+    mutated = true;
+    const typed = await run(injectExpr('/mcp'));
+    if (!typed.ok) {
+      await restore();
+      return { ok: false, error: `could not type /mcp: ${typed.reason}` };
+    }
+
+    const menu = await waitFor(
+      run,
+      MENU_STATE_EXPR,
+      (st) => st.items.some((label) => label.trim().replace(/^[/]/, '').toLowerCase().startsWith('mcp')),
+      { timeoutMs: 5000 },
+    );
+    if (!menu.items.length) {
+      await restore();
+      return { ok: false, error: 'typing /mcp opened no command menu' };
+    }
+
+    const picked = await run(CLICK_MCP_COMMAND_EXPR);
+    await restore();
+    if (!picked.ok) {
+      return {
+        ok: false,
+        error: `${picked.reason}${picked.seen && picked.seen.length ? ` (menu showed: ${picked.seen.join(', ')})` : ''}`,
+      };
+    }
+  } catch (err) {
+    // Any throw in here leaves "/mcp" sitting in someone's composer
+    // unless the restore runs. That is the whole reason for the finally
+    // shape rather than a cleanup call on each exit.
+    await restore();
+    throw err;
   }
 
   state = await waitFor(run, MCP_STATE_EXPR, (st) => st.panel !== 'none');
@@ -769,8 +838,21 @@ async function readMcpServers(run) {
   if (!opened.ok) return opened;
   let state = opened.state;
   if (state.panel === 'detail') {
-    await run(clickByText('backButton_', '← Back to list'));
-    state = await waitFor(run, MCP_STATE_EXPR, (st) => st.rows.length > 0);
+    const back = await run(clickByText('backButton_', '← Back to list'));
+    if (!back.ok) {
+      await closeMcpPanel(run);
+      return { ok: false, error: `could not get back to the server list: ${back.reason}` };
+    }
+    // Wait for the list, not for rows. Waiting for rows makes "the Back
+    // click did nothing" and "there are no servers" the same observation,
+    // and waitFor hands back its last look either way — so a stuck detail
+    // view returned ok with an empty list and the phone said there were
+    // no MCP servers.
+    state = await waitFor(run, MCP_STATE_EXPR, (st) => st.panel === 'list');
+    if (state.panel !== 'list') {
+      await closeMcpPanel(run);
+      return { ok: false, error: 'clicked Back but the server list never appeared' };
+    }
   }
   await closeMcpPanel(run);
   return { ok: true, servers: state.rows };
@@ -803,10 +885,75 @@ async function reconnectMcpServer(run, name) {
   // The button reads "Reconnecting…" while in flight; settled is when it
   // is gone. Not proof the server came back — the status badge is — but
   // proof the request completed rather than hanging.
-  await waitFor(run, RECONNECT_BUSY_EXPR, (st) => !st.busy, { timeoutMs: 20000 });
-  const after = await run(MCP_STATE_EXPR);
+  // Two waits, not one. A single "wait until not busy" passes on its
+  // first poll whenever React has not yet rendered the busy state — and
+  // also whenever the click did nothing at all — so the phone was told
+  // "reconnected" without anything having been observed to happen.
+  const started = await waitFor(
+    run,
+    RECONNECT_BUSY_EXPR,
+    (st) => st.busy && st.title === name,
+    { timeoutMs: 4000, everyMs: 150 },
+  );
+  if (!started.busy) {
+    // A reconnect can finish inside one poll interval, so this is not
+    // proof of failure — but it is not proof of success either, and
+    // saying so is the point.
+    const settled = await run(MCP_STATE_EXPR);
+    await closeMcpPanel(run);
+    return {
+      ok: true,
+      status: 'clicked, but never saw it start — check the laptop',
+      title: settled.title,
+    };
+  }
+
+  const ended = await waitFor(
+    run,
+    RECONNECT_BUSY_EXPR,
+    (st) => !st.busy && st.title === name,
+    { timeoutMs: 20000 },
+  );
   await closeMcpPanel(run);
-  return { ok: true, status: after.title === name ? 'reconnected' : 'done' };
+  if (ended.busy) return { ok: false, error: 'still reconnecting after 20s' };
+  if (ended.title !== name) {
+    return { ok: false, error: 'the detail view moved away while reconnecting' };
+  }
+  return { ok: true, status: ended.status ? `reconnected — ${ended.status}` : 'reconnected' };
+}
+
+// Serialise everything that touches one session's composer or panel.
+//
+// _handleMessage is started per inbound frame and never awaited, so two
+// phone taps — or a tap and an ordinary submit — run concurrently against
+// the same webview over separate CDP connections. The MCP flow puts
+// "/mcp" in the composer and takes it out again; a submit landing in that
+// window types after it and dispatches Cmd+Enter, sending the command and
+// the message as one string. Two MCP actions can likewise snapshot each
+// other's half-finished drafts and have the later cleanup erase the
+// earlier restore.
+//
+// A queue rather than a rejection: these are seconds long, and a phone
+// tap that answers "busy, try again" is a worse trade than one that
+// waits its turn.
+class SessionQueue {
+  constructor() {
+    this.tails = new Map(); // sessionId -> promise chain
+  }
+
+  run(sessionId, fn) {
+    const prev = this.tails.get(sessionId) || Promise.resolve();
+    // Never let a rejection poison the chain for the next caller.
+    const next = prev.then(fn, fn);
+    this.tails.set(
+      sessionId,
+      next.then(
+        () => {},
+        () => {}
+      )
+    );
+    return next;
+  }
 }
 
 class Daemon {
@@ -826,6 +973,7 @@ class Daemon {
     // When the VPS was last heard from at all. Any inbound frame counts,
     // including the pong; see watchConnection.
     this.lastInboundAt = 0;
+    this.queue = new SessionQueue();
   }
 
   // ms since the VPS last said anything, or null when there is no socket
@@ -978,7 +1126,11 @@ class Daemon {
     if (msg.type === 'submit') {
       const watcher = this.watchers.get(msg.sessionId);
       if (watcher) {
-        const result = await watcher.submit(msg.text).catch((err) => ({ ok: false, reason: err.message }));
+        // Queued for the same reason the MCP actions are: this types into
+        // the composer an MCP flow may be halfway through borrowing.
+        const result = await this.queue
+          .run(msg.sessionId, () => watcher.submit(msg.text))
+          .catch((err) => ({ ok: false, reason: err.message }));
         this._send({
           type: 'submit_ack',
           sessionId: msg.sessionId,
@@ -988,16 +1140,23 @@ class Daemon {
         return;
       }
       // Not currently subscribed — one-shot attach just to submit.
-      const temp = new SessionWatcher(msg.sessionId, () => {});
-      try {
-        await temp.attach();
-        const result = await temp.submit(msg.text);
-        this._send({ type: 'submit_ack', sessionId: msg.sessionId, ok: !!result.ok, error: result.reason });
-      } catch (err) {
-        this._send({ type: 'submit_ack', sessionId: msg.sessionId, ok: false, error: err.message });
-      } finally {
-        temp.close();
-      }
+      const result = await this.queue.run(msg.sessionId, async () => {
+        const temp = new SessionWatcher(msg.sessionId, () => {});
+        try {
+          await temp.attach();
+          return await temp.submit(msg.text);
+        } catch (err) {
+          return { ok: false, reason: err.message };
+        } finally {
+          temp.close();
+        }
+      });
+      this._send({
+        type: 'submit_ack',
+        sessionId: msg.sessionId,
+        ok: !!result.ok,
+        error: result.ok ? undefined : result.reason,
+      });
       return;
     }
   }
@@ -1031,25 +1190,44 @@ class Daemon {
   // and so the one whose MCP state they mean.
   async _mcpSessionId() {
     const targets = await cdp.listClaudeSessions(CDP_PORT);
-    if (!targets.length) return null;
+    if (!targets.length) return { error: 'no Claude Code session is open' };
+    if (targets.length === 1) return { sessionId: targets[0].sessionId };
     const pair = await cdp.readActiveWebviewTitle(
       CDP_PORT,
       targets.map((t) => t.sessionId)
     );
-    return pair ? pair.webviewId : targets[0].sessionId;
+    // pickUniquePair refuses on split editor groups precisely because the
+    // pairing would be a guess. Turning that refusal into "use the first
+    // target" throws the guard away and reconnects a different session's
+    // MCP client while every later check — the row, the detail title, the
+    // button text — passes inside the wrong session.
+    if (!pair) {
+      return {
+        error:
+          'cannot tell which session is in front (several tabs selected or visible). ' +
+          'Focus one Claude Code tab on the laptop and try again.',
+      };
+    }
+    return { sessionId: pair.webviewId };
   }
 
   async listMcpServers() {
-    const sessionId = await this._mcpSessionId();
-    if (!sessionId) return { ok: false, error: 'no Claude Code session is open' };
-    const out = await this._withSession(sessionId, (run) => readMcpServers(run));
+    const picked = await this._mcpSessionId();
+    if (picked.error) return { ok: false, error: picked.error };
+    const sessionId = picked.sessionId;
+    const out = await this.queue.run(sessionId, () =>
+      this._withSession(sessionId, (run) => readMcpServers(run))
+    );
     return { ...out, sessionId };
   }
 
   async reconnectMcp(name) {
-    const sessionId = await this._mcpSessionId();
-    if (!sessionId) return { ok: false, error: 'no Claude Code session is open' };
-    const out = await this._withSession(sessionId, (run) => reconnectMcpServer(run, name));
+    const picked = await this._mcpSessionId();
+    if (picked.error) return { ok: false, error: picked.error };
+    const sessionId = picked.sessionId;
+    const out = await this.queue.run(sessionId, () =>
+      this._withSession(sessionId, (run) => reconnectMcpServer(run, name))
+    );
     return { ...out, sessionId };
   }
 
@@ -1088,6 +1266,15 @@ class Daemon {
 
     // The new webview mounts before its composer does, so retry rather
     // than racing it.
+    return await this.queue.run(fresh, () => this._typeIntoNewSession(fresh, text));
+  }
+
+  // Retry until the brand-new webview has a composer, but never after the
+  // submit keystroke has gone out: submit dispatches Cmd+Enter as two
+  // awaited CDP calls, so a connection failing between keyDown and keyUp
+  // leaves a prompt that may already have been sent. Retrying there sends
+  // it twice; saying "I do not know" is the honest answer.
+  async _typeIntoNewSession(fresh, text) {
     const deadline = Date.now() + 15000;
     let last = { ok: false, reason: 'never attached' };
     while (Date.now() < deadline) {
@@ -1096,6 +1283,13 @@ class Daemon {
         await w.attach();
         last = await w.submit(text);
         if (last.ok) return { ok: true, sessionId: fresh };
+        if (last.dispatched) {
+          return {
+            ok: false,
+            sessionId: fresh,
+            error: `session created; the prompt may or may not have been sent (${last.reason}) — check the laptop`,
+          };
+        }
       } catch (err) {
         last = { ok: false, reason: err.message };
       } finally {
@@ -1335,6 +1529,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  SessionQueue,
   clickByName,
   CLEAR_COMPOSER_EXPR,
   RECONNECT_BUSY_EXPR,

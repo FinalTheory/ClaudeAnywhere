@@ -9,6 +9,9 @@ const assert = require('node:assert');
 
 const cdp = require('../cdp-client.js');
 const {
+  SessionQueue,
+  CLEAR_COMPOSER_EXPR,
+  MENU_STATE_EXPR,
   clickByName,
   CLICK_MCP_COMMAND_EXPR,
   clickByText,
@@ -953,15 +956,26 @@ function fakeDom(nodes) {
       return hit ? { textContent: hit[1] } : null;
     },
   }));
+  const find = (sel) => {
+    const want = sel.match(/class\*="([^"]+)"/)[1];
+    return els.filter((e) => e.className.includes(want));
+  };
+  // A single root every element hangs off, so the "walk up to the panel
+  // that owns this title, then query inside it" logic has something to
+  // walk. A flat bag of elements would pass a scoping check vacuously,
+  // which is the bug that check exists to catch.
+  const root = {
+    className: 'root',
+    parentElement: null,
+    querySelectorAll: (sel) => find(sel),
+    querySelector: (sel) => find(sel)[0] || null,
+  };
+  for (const el of els) el.parentElement = root;
   return {
     els,
-    querySelectorAll(sel) {
-      const want = sel.match(/class\*="([^"]+)"/)[1];
-      return els.filter((e) => e.className.includes(want));
-    },
-    querySelector(sel) {
-      return this.querySelectorAll(sel)[0] || null;
-    },
+    root,
+    querySelectorAll: (sel) => find(sel),
+    querySelector: (sel) => find(sel)[0] || null,
   };
 }
 
@@ -1007,12 +1021,13 @@ test('clickReconnectFor: refuses when the detail view is another server', () => 
 test('clickReconnectFor: clicks once the title matches', () => {
   const dom = fakeDom([
     { cls: 'detailTitle_IHCQeQ', text: 'jira-ghe' },
+    { cls: 'detailActions_IHCQeQ', text: '' },
     { cls: 'actionButton_IHCQeQ', text: 'Reconnect' },
     { cls: 'actionButton_IHCQeQ dangerButton_IHCQeQ', text: 'Remove' },
   ]);
   const out = runExpr(clickReconnectFor('jira-ghe'), dom);
   assert.strictEqual(out.ok, true);
-  assert.deepStrictEqual(dom.els.map((e) => e.clicked), [0, 1, 0]);
+  assert.deepStrictEqual(dom.els.map((e) => e.clicked), [0, 0, 1, 0]);
 });
 
 test('clickReconnectFor: refuses when there is no detail view at all', () => {
@@ -1226,4 +1241,200 @@ test('clickByText would not have found the icon button — the reason clickByNam
   const dom = fakeDom([{ cls: 'iconButton_YKLzCw', text: '', label: 'Close' }]);
   assert.strictEqual(runExpr(clickByText('iconButton_', 'Close'), dom).ok, false);
   assert.strictEqual(dom.els[0].clicked, 0);
+});
+
+// --- round 8: acting on the wrong thing, and calling it success ----------
+
+test('clickServerRow: two rows with the same trimmed name are not actionable', () => {
+  // The name is trimmed for display and comes back as the request, so
+  // "alpha" and " alpha " arrive indistinguishable. Clicking the first
+  // would reconnect whichever rendered earlier, not the one tapped.
+  const dom = fakeDom([
+    { cls: 'serverItem_IHCQeQ', text: '', children: { serverName_: 'alpha' } },
+    { cls: 'serverItem_IHCQeQ', text: '', children: { serverName_: 'alpha' } },
+  ]);
+  const out = runExpr(clickServerRow('alpha'), dom);
+  assert.strictEqual(out.ok, false);
+  assert.match(out.reason, /more than one server/);
+  assert.deepStrictEqual(dom.els.map((e) => e.clicked), [0, 0]);
+});
+
+test('clickReconnectFor: refuses when several detail views are mounted', () => {
+  const dom = fakeDom([
+    { cls: 'detailTitle_IHCQeQ', text: 'jira-ghe' },
+    { cls: 'detailTitle_IHCQeQ', text: 'github' },
+    { cls: 'detailActions_IHCQeQ', text: '' },
+    { cls: 'actionButton_IHCQeQ', text: 'Reconnect' },
+  ]);
+  const out = runExpr(clickReconnectFor('jira-ghe'), dom);
+  assert.strictEqual(out.ok, false);
+  assert.match(out.reason, /more than one detail view/);
+  assert.strictEqual(dom.els[3].clicked, 0);
+});
+
+test('clickReconnectFor: refuses when the title has no actions around it', () => {
+  // Verifying a document-wide title and then clicking a document-wide
+  // button checks one element and acts on another. Without a container
+  // holding both, there is nothing to act on.
+  const dom = fakeDom([
+    { cls: 'detailTitle_IHCQeQ', text: 'jira-ghe' },
+    { cls: 'actionButton_IHCQeQ', text: 'Reconnect' },
+  ]);
+  const out = runExpr(clickReconnectFor('jira-ghe'), dom);
+  assert.strictEqual(out.ok, false);
+  assert.strictEqual(dom.els[1].clicked, 0);
+});
+
+test('CLEAR_COMPOSER_EXPR: a refused edit is reported, not assumed', () => {
+  const box = { value: 'draft', focus() {}, innerHTML: 'draft' };
+  const doc = {
+    querySelectorAll: () => [box],
+    execCommand: (cmd) => cmd !== 'delete', // delete refused
+  };
+  const out = runExpr(CLEAR_COMPOSER_EXPR, doc);
+  assert.strictEqual(out.ok, false);
+  assert.match(out.reason, /delete refused/);
+});
+
+test('CLEAR_COMPOSER_EXPR: text surviving the clear is a failure', () => {
+  const box = { value: 'still here', focus() {}, innerHTML: '' };
+  const doc = { querySelectorAll: () => [box], execCommand: () => true };
+  const out = runExpr(CLEAR_COMPOSER_EXPR, doc);
+  assert.strictEqual(out.ok, false);
+  assert.match(out.reason, /still holds text/);
+});
+
+test('MENU_STATE_EXPR: a rich draft is flagged as unrestorable', () => {
+  // textContent flattens <p>a</p><p>b</p> to "ab"; putting that back
+  // would rewrite what the author typed.
+  const mk = (text, html) => ({
+    querySelectorAll: (sel) =>
+      sel.includes('commandItem_') ? [] : [{ value: text, innerHTML: html, textContent: text }],
+  });
+  assert.strictEqual(runExpr(MENU_STATE_EXPR, mk('hello', 'hello')).structured, false);
+  assert.strictEqual(runExpr(MENU_STATE_EXPR, mk('a\nb', 'a<br>b')).structured, true);
+  assert.strictEqual(runExpr(MENU_STATE_EXPR, mk('ab', '<p>a</p><p>b</p>')).structured, true);
+});
+
+// --- the queue ------------------------------------------------------------
+
+test('SessionQueue: operations on one session run one at a time', async () => {
+  const q = new SessionQueue();
+  const order = [];
+  const slow = () =>
+    q.run('s', async () => {
+      order.push('a-start');
+      await new Promise((r) => setTimeout(r, 30));
+      order.push('a-end');
+    });
+  const fast = () =>
+    q.run('s', async () => {
+      order.push('b-start');
+      order.push('b-end');
+    });
+  await Promise.all([slow(), fast()]);
+  assert.deepStrictEqual(order, ['a-start', 'a-end', 'b-start', 'b-end'], 'no interleaving');
+});
+
+test('SessionQueue: different sessions do not block each other', async () => {
+  const q = new SessionQueue();
+  const order = [];
+  await Promise.all([
+    q.run('s1', async () => {
+      await new Promise((r) => setTimeout(r, 30));
+      order.push('slow');
+    }),
+    q.run('s2', async () => {
+      order.push('fast');
+    }),
+  ]);
+  assert.deepStrictEqual(order, ['fast', 'slow']);
+});
+
+test('SessionQueue: a rejection does not poison the chain', async () => {
+  const q = new SessionQueue();
+  await assert.rejects(() => q.run('s', async () => { throw new Error('boom'); }));
+  assert.strictEqual(await q.run('s', async () => 'still works'), 'still works');
+});
+
+test('submit: a failed submitting keystroke is flagged as dispatched', async (t) => {
+  // keyDown may already have submitted, so the caller must not retry.
+  const { w } = watcherWithFakeCdp(t);
+  w.client.send = async (method, params) => {
+    if (method === 'Input.dispatchKeyEvent' && params.modifiers === CMD_MODIFIER) {
+      throw new Error('connection lost');
+    }
+    return {};
+  };
+  const out = await w.submit('hello');
+  assert.strictEqual(out.ok, false);
+  assert.strictEqual(out.dispatched, true, 'so newSession reports uncertainty instead of resending');
+});
+
+test('_mcpSessionId: refuses rather than picking one when the active view is ambiguous', async (t) => {
+  // pickUniquePair returns null on split editor groups precisely because
+  // the pairing would be a guess. Turning that into "use the first
+  // target" reconnects a different session's MCP client while every
+  // later check passes inside the wrong session.
+  t.mock.method(cdp, 'listClaudeSessions', async () => [
+    { sessionId: 'wv-1' },
+    { sessionId: 'wv-2' },
+  ]);
+  t.mock.method(cdp, 'readActiveWebviewTitle', async () => null);
+  const out = await new Daemon()._mcpSessionId();
+  assert.strictEqual(out.sessionId, undefined);
+  assert.match(out.error, /cannot tell which session/);
+});
+
+test('_mcpSessionId: a single session needs no disambiguation', async (t) => {
+  t.mock.method(cdp, 'listClaudeSessions', async () => [{ sessionId: 'only' }]);
+  t.mock.method(cdp, 'readActiveWebviewTitle', async () => null);
+  assert.strictEqual((await new Daemon()._mcpSessionId()).sessionId, 'only');
+});
+
+test('_mcpSessionId: an unambiguous active view is used', async (t) => {
+  t.mock.method(cdp, 'listClaudeSessions', async () => [
+    { sessionId: 'wv-1' },
+    { sessionId: 'wv-2' },
+  ]);
+  t.mock.method(cdp, 'readActiveWebviewTitle', async () => ({ webviewId: 'wv-2', title: 'x' }));
+  assert.strictEqual((await new Daemon()._mcpSessionId()).sessionId, 'wv-2');
+});
+
+test('clickReconnectFor: a Reconnect button outside the verified panel is not clicked', () => {
+  // The scoping check, with a DOM that can actually tell the difference:
+  // an exact-text Reconnect in another mounted section, and the real one
+  // inside the panel that owns the verified title.
+  const outside = { className: 'actionButton_IHCQeQ', textContent: 'Reconnect', disabled: false, clicked: 0, click() { this.clicked++; }, getAttribute: () => null };
+  const inside = { className: 'actionButton_IHCQeQ', textContent: 'Reconnect', disabled: false, clicked: 0, click() { this.clicked++; }, getAttribute: () => null };
+  const actions = { className: 'detailActions_IHCQeQ', textContent: '', getAttribute: () => null };
+  const sel = (nodes) => (s) => {
+    const want = s.match(/class\*="([^"]+)"/)[1];
+    return nodes.filter((n) => n.className.includes(want));
+  };
+  const panelNodes = [actions, inside];
+  const panel = {
+    className: 'detailPanel_IHCQeQ',
+    parentElement: null,
+    querySelectorAll: (s) => sel(panelNodes)(s),
+    querySelector: (s) => sel(panelNodes)(s)[0] || null,
+  };
+  const title = {
+    className: 'detailTitle_IHCQeQ',
+    textContent: 'jira-ghe',
+    parentElement: panel,
+    getAttribute: () => null,
+    // the title itself contains no actions, so the walk moves up to panel
+    querySelector: () => null,
+    querySelectorAll: () => [],
+  };
+  const all = [title, actions, inside, outside];
+  const doc = {
+    querySelectorAll: (s) => sel(all)(s),
+    querySelector: (s) => sel(all)(s)[0] || null,
+  };
+  const out = runExpr(clickReconnectFor('jira-ghe'), doc);
+  assert.strictEqual(out.ok, true);
+  assert.strictEqual(inside.clicked, 1, 'the one inside the verified panel');
+  assert.strictEqual(outside.clicked, 0, 'and nothing else');
 });
