@@ -254,3 +254,24 @@ test('phone: a history request in flight does not disable the next conversation'
   `);
   assert.strictEqual(out.loadingMore, false);
 });
+
+test('phone: the redial scheduled by a dead socket does not close a healthy one', async () => {
+  // Round 13 guarded every socket callback and not the timer one of them
+  // schedules. Between the schedule and its firing, foregrounding the tab
+  // dials its own socket; unguarded, this closes that healthy one and
+  // starts over — a second transcript rebuild that discards the history
+  // the author had paged in.
+  const { out } = loadPhone(`
+    openSession('A', 'alpha');
+    const dead = ws;
+    dead.onclose();              // schedules a redial for this session
+    openSession('A', 'alpha');   // the tab comes back and dials its own
+    const healthy = ws;
+    return (async () => {
+      await new Promise((r) => setTimeout(r, 700));
+      return { replaced: ws !== healthy };
+    })();
+  `);
+  const got = await out;
+  assert.strictEqual(got.replaced, false, 'the orphaned timer must not dial over a live socket');
+});
