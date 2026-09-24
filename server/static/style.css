@@ -474,3 +474,33 @@ body > #session-detail {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Notes have their own line so a stale one cannot hide Running/Idle, and
+   so a wrapped sentence does not shove the transcript around. Tappable —
+   more things raise a note than are known to retract one. */
+#notice {
+  flex: none;
+  padding: 6px 12px;
+  font-size: calc(12px * var(--app-font-scale));
+  line-height: 1.4;
+  color: var(--vscode-inputValidation-warningForeground, #ddd);
+  background: var(--vscode-inputValidation-warningBackground, #4d3800);
+  border-bottom: 1px solid var(--vscode-panel-border, #333);
+  cursor: pointer;
+}
+
+/* One per conversation, shown when the daemon cannot tell which is in
+   front. Full-width taps: this appears exactly when the author is not at
+   the laptop and cannot resolve the ambiguity there. */
+.mcp-candidate {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 10px 12px;
+  text-align: left;
+  font-size: calc(13px * var(--app-font-scale));
+  color: var(--vscode-foreground, #ccc);
+  background: var(--vscode-button-secondaryBackground, #3a3d41);
+  border: none;
+  border-radius: 4px;
+}

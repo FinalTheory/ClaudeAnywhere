@@ -191,3 +191,66 @@ test('phone: a session list that is not the expected shape says so', () => {
     assert.deepStrictEqual(got.signedOut, ['Signed out'], 'an expired cookie is named, not a blank screen');
   });
 });
+
+test('phone: a successful send retracts the failure before it', () => {
+  // Making notes outrank the live state was correct and incomplete:
+  // nothing in the system cleared a note on the event that contradicts
+  // it, so a send refused by the busy guard and then retried
+  // successfully still read "send failed".
+  const { out } = loadPhone(`
+    openSession('A', 'alpha');
+    const sock = ws;
+    submitText('m1');
+    sock.onmessage({ data: JSON.stringify({ type: 'submit_ack', ok: false, error: 'busy' }) });
+    const failed = statusNote;
+    submitText('m2');
+    sock.onmessage({ data: JSON.stringify({ type: 'submit_ack', ok: true }) });
+    return { failed, after: statusNote };
+  `);
+  assert.match(out.failed, /send failed/);
+  assert.strictEqual(out.after, null);
+});
+
+test('phone: the daemon reattaching retracts the outage notice', () => {
+  // The outage is reported once. If running and turns are unchanged
+  // across the reattach, no other frame follows, so without its
+  // counterpart the notice is the last word on the matter.
+  const { out } = loadPhone(`
+    openSession('A', 'alpha');
+    const sock = ws;
+    sock.onmessage({ data: JSON.stringify({ type: 'error', message: 'No target matched' }) });
+    const during = statusNote;
+    sock.onmessage({ data: JSON.stringify({ type: 'recovered' }) });
+    return { during, after: statusNote };
+  `);
+  assert.match(out.during, /No target matched/);
+  assert.strictEqual(out.after, null);
+});
+
+test('phone: a note never hides Running/Idle', () => {
+  // They shared one slot, so a note that nothing retracted also hid the
+  // only indicator of what the laptop is doing.
+  const { out } = loadPhone(`
+    openSession('A', 'alpha');
+    const sock = ws;
+    sock.onmessage({ data: JSON.stringify({ type: 'error', message: 'selector mismatch' }) });
+    sock.onmessage({ data: JSON.stringify({ type: 'state', running: true }) });
+    return { status: statusEl.textContent, note: noticeEl.textContent };
+  `);
+  assert.strictEqual(out.status, 'Running...');
+  assert.strictEqual(out.note, 'selector mismatch');
+});
+
+test('phone: a history request in flight does not disable the next conversation', () => {
+  // loadingMore is global. Left set by the conversation being left, the
+  // new one's fillViewport bails on its first pass — and if its window
+  // does not overflow, no scroll event ever fires and its older history
+  // is unreachable with nothing said.
+  const { out } = loadPhone(`
+    openSession('A', 'alpha');
+    loadingMore = true;
+    openSession('B', 'beta');
+    return { loadingMore };
+  `);
+  assert.strictEqual(out.loadingMore, false);
+});

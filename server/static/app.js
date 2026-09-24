@@ -13,6 +13,7 @@ const transcriptEl = document.getElementById('transcript');
 const statusEl = document.getElementById('status');
 const backBtn = document.getElementById('back-btn');
 const titleEl = document.getElementById('session-title');
+const noticeEl = document.getElementById('notice');
 const sendForm = document.getElementById('send-form');
 const promptInput = document.getElementById('prompt-input');
 const sendBtn = sendForm.querySelector('button[type="submit"]');
@@ -225,6 +226,18 @@ function renderMcp(out) {
     p.className = 'action-status bad';
     p.textContent = out.error || 'could not read the MCP list';
     mcpListEl.appendChild(p);
+    // The daemon refuses to guess which conversation is in front when
+    // more than one is open and none is unambiguously on screen — which
+    // is the ordinary state when the author is away from the laptop, and
+    // exactly when they want this. Answering the refusal from the phone
+    // is what stops it being a dead end.
+    for (const c of out.candidates || []) {
+      const btn = document.createElement('button');
+      btn.className = 'mcp-candidate';
+      btn.textContent = c.title || c.sessionId;
+      btn.onclick = () => refreshMcp(c.sessionId);
+      mcpListEl.appendChild(btn);
+    }
     return;
   }
   if (!out.servers || !out.servers.length) {
@@ -256,7 +269,10 @@ function renderMcp(out) {
       // button disabled on "Reconnecting…" with nothing said — the exact
       // silent stall this is meant to fix.
       try {
-        const res = await postJson('/api/mcp/reconnect', { serverName: srv.name });
+        const res = await postJson('/api/mcp/reconnect', {
+          serverName: srv.name,
+          ...(mcpSessionId ? { sessionId: mcpSessionId } : {}),
+        });
         if (res.ok) {
           // ok does not always mean confirmed. The daemon returns a
           // status sentence when it clicked but never saw the reconnect
@@ -293,11 +309,18 @@ function renderMcp(out) {
 
 let mcpLoaded = false;
 
-async function refreshMcp() {
+// Remembered so the reconnect buttons address the same conversation the
+// list was read from. Reading one session's panel and reconnecting in
+// another's would put the click in a session whose rows were never shown.
+let mcpSessionId = null;
+
+async function refreshMcp(sessionId) {
+  mcpSessionId = sessionId || null;
   mcpRefreshBtn.disabled = true;
   mcpListEl.innerHTML = '<p class="action-status">Opening the MCP panel on the laptop…</p>';
   try {
-    const out = await postJson('/api/mcp', {});
+    const out = await postJson('/api/mcp', mcpSessionId ? { sessionId: mcpSessionId } : {});
+    if (out.sessionId) mcpSessionId = out.sessionId;
     renderMcp(out);
     mcpLoaded = !!(out.ok && out.servers && out.servers.length);
   } catch (err) {
@@ -360,6 +383,13 @@ function showListNotice(heading, detail, raw, withRetry = true) {
 function leaveSession() {
   for (const p of pendingSends) clearTimeout(p.timeoutId);
   pendingSends = [];
+  // Both are global and neither described the new conversation. A
+  // history request still in flight for the old one leaves loadingMore
+  // set, so the new session's fillViewport bails on its first pass — and
+  // if its initial window does not overflow, no scroll event ever fires
+  // and its older history is unreachable with nothing said.
+  loadingMore = false;
+  fillGeneration += 1;
   const abandoned = queuedSends.filter((q) => q.sessionId === currentSessionId);
   queuedSends = queuedSends.filter((q) => q.sessionId !== currentSessionId);
   promptInput.value = '';
@@ -425,7 +455,15 @@ function connectPhoneWs(sessionId, delay) {
     // send. The transcript otherwise just stops moving.
     setNote('Reconnecting to the server…');
     const nextDelay = Math.min((delay || 500) * 2, 8000);
-    setTimeout(() => connectPhoneWs(sessionId, nextDelay), delay || 500);
+    setTimeout(() => {
+      // Guarded like the callbacks are. Between scheduling this and its
+      // firing, foregrounding the tab dials its own socket; without the
+      // check this closes that healthy one and starts over, which the
+      // author sees as a second transcript rebuild that discards the
+      // history they had paged in.
+      if (gen !== wsGeneration || sessionId !== currentSessionId) return;
+      connectPhoneWs(sessionId, nextDelay);
+    }, delay || 500);
   };
   ws.onopen = () => {
     // Orphaned sockets must not flush the queue either: submitText writes
@@ -488,6 +526,11 @@ function connectPhoneWs(sessionId, delay) {
       // "Running..." with nothing to explain it. No `state` frame follows
       // an outage, so this stays on screen until the session recovers.
       setNote(msg.message);
+    } else if (msg.type === 'recovered') {
+      // The daemon reattached. Nothing else retracts the outage notice:
+      // if running and turns are unchanged across the reattach, no other
+      // frame follows it.
+      clearNote();
     } else if (msg.type === 'laptop') {
       // The VPS lost or regained the daemon. The phone's own liveness ping
       // only proves the VPS is up, so nothing else distinguishes a laptop
@@ -497,6 +540,10 @@ function connectPhoneWs(sessionId, delay) {
     } else if (msg.type === 'submit_ack') {
       const answered = pendingSends.shift();
       if (answered) clearTimeout(answered.timeoutId);
+      // The event that contradicts the note. Without this a send refused
+      // by the daemon's busy guard, then retried successfully, still
+      // reads "send failed: busy driving Claude Code…".
+      if (msg.ok) clearNote();
       if (!msg.ok) {
         setNote(`send failed: ${msg.error || 'unknown error'}`);
         // The input was cleared optimistically on send (see sendForm.onsubmit)
@@ -514,32 +561,47 @@ function connectPhoneWs(sessionId, delay) {
   };
 }
 
-// A note outranks the running state until something clears it. Without
-// that, the one instrument built to reach a person is displayed for less
-// than a frame: the daemon emits its DOM-mismatch warning and, in the same
-// tick, a `state` frame — on a fresh watcher `lastRunning` is null, so one
-// always follows — and the phone renders the warning and overwrites it.
-// "send failed" and the send-timeout note were erased the same way, which
-// is what left a restored message sitting in the composer unexplained.
+// Notes have their own line, and Running/Idle keeps its own.
+//
+// Sharing one slot cost twice over. A note had to outrank the live state
+// or it showed for less than a frame — the daemon emits its DOM-mismatch
+// warning and a `state` frame in the same tick, and on a fresh watcher a
+// `state` frame always follows. Outranking it then meant a note that
+// nothing cleared hid Running/Idle for as long as it sat there, and
+// nothing in the system clears a note on the event that contradicts it:
+// a refused send followed by a successful one still reads "send failed".
+// Two lines, plus a clear on the contradicting event, and neither
+// mechanism has to lose.
+//
+// Notes are also tappable, because the list of things that can raise one
+// is longer than the list of events known to retract one.
 let statusNote = null;
 let lastRunning = null;
 
 function setNote(note) {
-  statusNote = note;
-  setStatus(lastRunning);
+  statusNote = note || null;
+  renderNote();
 }
 
 function clearNote() {
   statusNote = null;
-  setStatus(lastRunning);
+  renderNote();
+}
+
+// The set of events that can raise a note is larger than the set known to
+// retract one, so there is always a way out by hand.
+noticeEl.onclick = () => clearNote();
+
+function renderNote() {
+  noticeEl.textContent = statusNote || '';
+  noticeEl.hidden = !statusNote;
 }
 
 function setStatus(running, note) {
-  if (note !== undefined) statusNote = note;
+  if (note !== undefined) setNote(note);
   lastRunning = running;
-  const shown = statusNote;
   statusEl.textContent =
-    shown || (running ? 'Running...' : running === false ? 'Idle' : 'Unknown');
+    running ? 'Running...' : running === false ? 'Idle' : 'Unknown';
   // Not a hard disable anymore — confirmed in practice this deadlocks: the
   // send-button/aria-label flip means "busy" whenever the assistant's turn
   // isn't finished, which is ALSO true while it's blocked on a pending
@@ -747,11 +809,18 @@ let loadingMore = false;
 // has no way to ask for more — the scroll event never fires and the older
 // turns are unreachable. The initial window is one whole turn, which is
 // usually several screens but need not be.
+// Bumped by leaveSession, so a loop started for one conversation stops
+// rather than paginating the next one.
+let fillGeneration = 0;
+
 async function fillViewport() {
+  const mine = fillGeneration;
   for (let guard = 0; guard < 5; guard++) {
+    if (mine !== fillGeneration) return;
     if (!hasMore || transcriptEl.scrollHeight > transcriptEl.clientHeight) return;
     const before = loadedStartIndex;
     await loadOlder();
+    if (mine !== fillGeneration) return;
     if (loadedStartIndex === before) return; // nothing moved; stop asking
   }
 }

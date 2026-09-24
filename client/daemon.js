@@ -144,7 +144,12 @@ const POLL_EXPR = `
   // data-transcript-message, which is markup rather than a build artifact,
   // so "messages exist but no turns" is a reliable tell that the turn
   // selector, not the conversation, is what went missing.
-  const messageCount = document.querySelectorAll('[data-transcript-message]').length;
+  // Only asked when there are no turns, which is the only case that reads
+  // it. Walking the whole document for this on every poll of a healthy
+  // conversation buys nothing: with turns present the answer is discarded.
+  const messageCount = turns.length === 0
+    ? document.querySelectorAll('[data-transcript-message]').length
+    : 0;
   return {
     running: btn ? btn.getAttribute('aria-label') === 'Stop' : null,
     turns,
@@ -572,6 +577,17 @@ class SessionWatcher {
     this.onEvent({ type: 'error', sessionId: this.sessionId, message: err.message });
   }
 
+  // The counterpart. Without it the outage notice is the last word the
+  // phone hears about the matter: if running and turns are unchanged
+  // across the reattach, no further frame is sent at all, and
+  // `No target matched "…"` stays on screen after everything is working
+  // again. One frame per recovery, matching one per outage.
+  _reportAttachRecovered() {
+    if (!this.attachFailed) return;
+    this.attachFailed = false;
+    this.onEvent({ type: 'recovered', sessionId: this.sessionId });
+  }
+
   _scheduleNext(delay) {
     if (this.closed) return;
     this.timer = setTimeout(() => this._tick(), delay);
@@ -620,7 +636,7 @@ class SessionWatcher {
       }
       try {
         await this.attach();
-        this.attachFailed = false; // back in business; report the next outage
+        this._reportAttachRecovered(); // and report the next outage
       } catch (reattachErr) {
         this._reportAttachFailure(reattachErr);
       }
@@ -1235,13 +1251,13 @@ class Daemon {
     }
 
     if (msg.type === 'list_mcp') {
-      const result = await this.listMcpServers();
+      const result = await this.listMcpServers(msg.sessionId);
       this._send({ type: 'action_result', reqId: msg.reqId, ...result });
       return;
     }
 
     if (msg.type === 'reconnect_mcp') {
-      const result = await this.reconnectMcp(msg.serverName);
+      const result = await this.reconnectMcp(msg.serverName, msg.sessionId);
       this._send({ type: 'action_result', reqId: msg.reqId, ...result });
       return;
     }
@@ -1342,9 +1358,19 @@ class Daemon {
   // — each one is its own CLI process with its own MCP clients — so this
   // has to name one. The visible tab is the one the author is looking at
   // and so the one whose MCP state they mean.
-  async _mcpSessionId() {
+  // `asked` is the phone naming a conversation itself. Without it the
+  // refusal below is a dead end: the MCP controls live on the list
+  // screen, so the author has no way to supply what the refusal asks
+  // for, and the state it asks them to fix — no Claude tab on screen
+  // because they were last editing a source file — is the ordinary one
+  // when they are away from the laptop, which is when they want this.
+  async _mcpSessionId(asked) {
     const targets = await cdp.listClaudeSessions(CDP_PORT);
     if (!targets.length) return { error: 'no Claude Code session is open' };
+    if (asked) {
+      if (targets.some((t) => t.sessionId === asked)) return { sessionId: asked };
+      return { error: `that conversation is no longer open on the laptop (${asked})` };
+    }
     if (targets.length === 1) return { sessionId: targets[0].sessionId };
     const pair = await cdp.readActiveWebviewTitle(
       CDP_PORT,
@@ -1356,18 +1382,22 @@ class Daemon {
     // MCP client while every later check — the row, the detail title, the
     // button text — passes inside the wrong session.
     if (!pair) {
+      // The candidates, so the refusal can be answered from the phone
+      // rather than only at the laptop. Two states reach here — several
+      // Claude tabs selected at once, or none on screen — and the answer
+      // to both is the same: name one.
       return {
         error:
-          'cannot tell which session is in front (several tabs selected or visible). ' +
-          'Focus one Claude Code tab on the laptop and try again.',
+          'cannot tell which conversation is in front on the laptop — pick one below',
+        candidates: targets.map((t) => ({ sessionId: t.sessionId, title: t.title || null })),
       };
     }
     return { sessionId: pair.webviewId };
   }
 
-  async listMcpServers() {
-    const picked = await this._mcpSessionId();
-    if (picked.error) return { ok: false, error: picked.error };
+  async listMcpServers(asked) {
+    const picked = await this._mcpSessionId(asked);
+    if (picked.error) return { ok: false, error: picked.error, candidates: picked.candidates };
     const sessionId = picked.sessionId;
     const out = await this.queue.runLong(sessionId, () =>
       this._withSession(sessionId, (run) => readMcpServers(run))
@@ -1375,9 +1405,9 @@ class Daemon {
     return { ...out, sessionId };
   }
 
-  async reconnectMcp(name) {
-    const picked = await this._mcpSessionId();
-    if (picked.error) return { ok: false, error: picked.error };
+  async reconnectMcp(name, asked) {
+    const picked = await this._mcpSessionId(asked);
+    if (picked.error) return { ok: false, error: picked.error, candidates: picked.candidates };
     const sessionId = picked.sessionId;
     const out = await this.queue.runLong(sessionId, () =>
       this._withSession(sessionId, (run) => reconnectMcpServer(run, name))

@@ -1469,7 +1469,33 @@ test('_mcpSessionId: refuses rather than picking one when the active view is amb
   t.mock.method(cdp, 'readActiveWebviewTitle', async () => null);
   const out = await new Daemon()._mcpSessionId();
   assert.strictEqual(out.sessionId, undefined);
-  assert.match(out.error, /cannot tell which session/);
+  assert.match(out.error, /cannot tell which conversation/);
+  // And the refusal is answerable: without the candidates it is a dead
+  // end, because the MCP controls live on the list screen and the state
+  // it asks the author to fix is at the laptop they are away from.
+  assert.deepStrictEqual(out.candidates.map((c) => c.sessionId), ['wv-1', 'wv-2']);
+});
+
+test('_mcpSessionId: a conversation named by the phone is used as given', async (t) => {
+  t.mock.method(cdp, 'listClaudeSessions', async () => [
+    { sessionId: 'wv-1' },
+    { sessionId: 'wv-2' },
+  ]);
+  let asked = false;
+  t.mock.method(cdp, 'readActiveWebviewTitle', async () => {
+    asked = true;
+    return null;
+  });
+  const out = await new Daemon()._mcpSessionId('wv-2');
+  assert.strictEqual(out.sessionId, 'wv-2');
+  assert.strictEqual(asked, false, 'naming one skips the disambiguation entirely');
+});
+
+test('_mcpSessionId: a named conversation that has since closed is refused, not guessed', async (t) => {
+  t.mock.method(cdp, 'listClaudeSessions', async () => [{ sessionId: 'wv-1' }]);
+  const out = await new Daemon()._mcpSessionId('wv-gone');
+  assert.strictEqual(out.sessionId, undefined);
+  assert.match(out.error, /no longer open/);
 });
 
 test('_mcpSessionId: a single session needs no disambiguation', async (t) => {

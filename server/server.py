@@ -439,7 +439,7 @@ async def ws_client_handler(request: web.Request) -> web.WebSocketResponse:
                     await broadcast(st, data)
             continue
 
-        if mtype == "error":
+        if mtype in ("error", "recovered"):
             st = sessions.get(data.get("sessionId", ""))
             if st:
                 await broadcast(st, data)
@@ -603,14 +603,25 @@ async def api_new_session(request: web.Request) -> web.Response:
 async def api_list_mcp(request: web.Request) -> web.Response:
     # Reading the list means opening Claude Code's MCP panel on the
     # laptop, so this is only ever done when the phone asks.
-    return await _action_route(request, lambda b: {"type": "list_mcp"}, timeout=30.0)
+    # sessionId is optional: the daemon picks the focused conversation when
+    # it can, and refuses with a candidate list when it cannot. The phone
+    # answers that refusal by naming one here.
+    return await _action_route(
+        request,
+        lambda b: {"type": "list_mcp", "sessionId": b.get("sessionId") or None},
+        timeout=30.0,
+    )
 
 
 @require_auth
 async def api_reconnect_mcp(request: web.Request) -> web.Response:
     return await _action_route(
         request,
-        lambda b: {"type": "reconnect_mcp", "serverName": str(b.get("serverName", ""))},
+        lambda b: {
+            "type": "reconnect_mcp",
+            "serverName": str(b.get("serverName", "")),
+            "sessionId": b.get("sessionId") or None,
+        },
         timeout=60.0,
     )
 
