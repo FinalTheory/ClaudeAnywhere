@@ -12,9 +12,11 @@ const {
   shouldEmitNow,
   RESYNC_MIN_INTERVAL_MS,
   resolveTitles,
-  watchForWake,
+  watchConnection,
   WAKE_PROBE_MS,
   WAKE_GAP_MS,
+  PING_EVERY_MS,
+  DEAD_AFTER_MS,
   Daemon,
   diffTurns,
   arraysEqual,
@@ -444,40 +446,98 @@ test('forceReconnect drops the watchers, so a fresh subscribe re-resyncs', async
   assert.strictEqual(w.closed, true);
 });
 
-test('watchForWake fires only when the clock jumped, not on normal ticks', async (t) => {
-  const calls = [];
-  const fake = { forceReconnect: (reason) => calls.push(reason) };
+// A hand-driven interval plus a fake clock: these pin scheduling, and
+// waiting WAKE_PROBE_MS of real time per assertion would not.
+function drivenWatcher(t, daemon) {
   const realNow = Date.now;
   let clock = 1_000_000;
   Date.now = () => clock;
-  t.after(() => {
-    Date.now = realNow;
-  });
-
-  // Drive the interval by hand rather than waiting WAKE_PROBE_MS of real time.
-  const timers = [];
   const realSetInterval = global.setInterval;
+  const ticks = [];
   global.setInterval = (fn) => {
-    timers.push(fn);
+    ticks.push(fn);
     return { unref() {} };
   };
   t.after(() => {
+    Date.now = realNow;
     global.setInterval = realSetInterval;
   });
+  watchConnection(daemon);
+  return {
+    tick: (advanceMs) => {
+      clock += advanceMs;
+      ticks[0]();
+    },
+  };
+}
 
-  watchForWake(fake);
-  const tick = timers[0];
+function fakeDaemon(quiet = 0) {
+  return {
+    reconnects: [],
+    pings: 0,
+    quiet,
+    forceReconnect(reason) {
+      this.reconnects.push(reason);
+    },
+    msSinceInbound() {
+      return this.quiet;
+    },
+    ping() {
+      this.pings++;
+    },
+  };
+}
 
-  clock += WAKE_PROBE_MS; tick();
-  clock += WAKE_PROBE_MS; tick();
-  assert.deepStrictEqual(calls, [], 'ordinary ticks are not a wake');
+test('watchConnection: a suspend is a wake, ordinary ticks are not', async (t) => {
+  const d = fakeDaemon();
+  const { tick } = drivenWatcher(t, d);
+  tick(WAKE_PROBE_MS);
+  tick(WAKE_PROBE_MS);
+  assert.deepStrictEqual(d.reconnects, [], 'ordinary ticks are not a wake');
+  tick(WAKE_GAP_MS + 1);
+  assert.strictEqual(d.reconnects.length, 1);
+  assert.match(d.reconnects[0], /suspended/);
+  tick(WAKE_PROBE_MS);
+  assert.strictEqual(d.reconnects.length, 1, 'and it does not keep firing');
+});
 
-  clock += WAKE_GAP_MS + 1; tick();
-  assert.strictEqual(calls.length, 1, 'a gap past the threshold is');
-  assert.match(calls[0], /suspended/);
+test('watchConnection: pings on a cadence well under the deadline', async (t) => {
+  // Otherwise an ordinary lost packet would look like a dead connection.
+  assert.ok(PING_EVERY_MS * 2 <= DEAD_AFTER_MS, 'two pings must fit inside the deadline');
+  const d = fakeDaemon();
+  const { tick } = drivenWatcher(t, d);
+  for (let i = 0; i < PING_EVERY_MS / WAKE_PROBE_MS; i++) tick(WAKE_PROBE_MS);
+  assert.strictEqual(d.pings, 1);
+});
 
-  clock += WAKE_PROBE_MS; tick();
-  assert.strictEqual(calls.length, 1, 'and it does not keep firing afterwards');
+test('watchConnection: silence past the deadline forces a reconnect', async (t) => {
+  // The wifi black-hole: readyState stays OPEN, no close ever fires, and
+  // the server's protocol pong never reaches daemon code. Inbound silence
+  // is the only observable.
+  const d = fakeDaemon(DEAD_AFTER_MS + 1);
+  const { tick } = drivenWatcher(t, d);
+  tick(WAKE_PROBE_MS);
+  assert.strictEqual(d.reconnects.length, 1);
+  assert.match(d.reconnects[0], /No answer from the VPS/);
+});
+
+test('watchConnection: a live connection is left alone', async (t) => {
+  const d = fakeDaemon(1000);
+  const { tick } = drivenWatcher(t, d);
+  tick(WAKE_PROBE_MS);
+  tick(WAKE_PROBE_MS);
+  assert.deepStrictEqual(d.reconnects, []);
+});
+
+test('watchConnection: no socket means the reconnect loop owns it, not us', async (t) => {
+  // msSinceInbound returns null while dialling. Treating that as silence
+  // would fight the backoff loop with a forced reconnect every 5s.
+  const d = fakeDaemon(null);
+  const { tick } = drivenWatcher(t, d);
+  tick(WAKE_PROBE_MS);
+  tick(WAKE_PROBE_MS);
+  assert.deepStrictEqual(d.reconnects, []);
+  assert.strictEqual(d.pings, 0, 'and nothing is sent into a socket that is not open');
 });
 
 // --- resolveTitles: naming a conversation ---------------------------------
@@ -769,4 +829,87 @@ test('_listSessions: a reported uuid does read the sidebar', async (t) => {
   const [s] = (await d._listSessions()).sessions;
   assert.strictEqual(sidebarReads, 1);
   assert.strictEqual(s.title, 'EKP-63451');
+});
+
+test('Daemon: msSinceInbound is null until the socket is open and has spoken', async (t) => {
+  const sockets = withFakeSockets(t);
+  const d = new Daemon();
+  assert.strictEqual(d.msSinceInbound(), null, 'no socket at all');
+  d.connect();
+  sockets[0].emit('open');
+  const quiet = d.msSinceInbound();
+  assert.ok(quiet !== null && quiet < 1000, 'open starts the clock, not message #1');
+});
+
+test('Daemon: any inbound frame resets the liveness clock', async (t) => {
+  const sockets = withFakeSockets(t);
+  const d = new Daemon();
+  d.connect();
+  sockets[0].emit('open');
+  d.lastInboundAt = Date.now() - 50_000;
+  assert.ok(d.msSinceInbound() > 40_000);
+  sockets[0].emit('message', { data: JSON.stringify({ type: 'pong' }) });
+  await new Promise((r) => setTimeout(r, 5));
+  assert.ok(d.msSinceInbound() < 1000, 'the pong is the answer the deadline waits for');
+});
+
+// --- subscribing while VS Code is down ------------------------------------
+// Reachable on every wake: the daemon redials in ~5s and the server
+// immediately re-issues subscribe for whatever the phone still has open,
+// usually before VS Code's debug port is listening again.
+
+test('subscribe with 9222 down keeps the watcher and keeps polling', async (t) => {
+  const sockets = withFakeSockets(t);
+  t.mock.method(cdp, 'findTarget', async () => {
+    throw new TypeError('fetch failed');
+  });
+  const d = new Daemon();
+  d.connect();
+  sockets[0].emit('open');
+
+  await d._handleMessage(JSON.stringify({ type: 'subscribe', sessionId: 'sid' }));
+  const w = d.watchers.get('sid');
+  assert.ok(w, 'the subscription survives a failed first attach');
+  assert.ok(w.timer, 'and its poll loop is running, which is what retries the attach');
+  w.close();
+});
+
+test('subscribe with 9222 down reports the failure once, not once per poll', async (t) => {
+  const sent = [];
+  t.mock.method(cdp, 'findTarget', async () => {
+    throw new TypeError('fetch failed');
+  });
+  const w = new SessionWatcher('sid', (e) => sent.push(e));
+  t.after(() => w.close());
+
+  await w.start();
+  await w._tick();
+  await w._tick();
+  assert.deepStrictEqual(
+    sent.filter((e) => e.type === 'error').length,
+    1,
+    'an outage is one event, not one every 1.5s',
+  );
+});
+
+test('a watcher that reattaches reports the next outage again', async (t) => {
+  const sent = [];
+  let up = false;
+  t.mock.method(cdp, 'findTarget', async () => {
+    if (!up) throw new TypeError('fetch failed');
+    return { webSocketDebuggerUrl: 'ws://x' };
+  });
+  t.mock.method(cdp, 'connect', async () => ({ ws: { close() {} }, send: async () => ({}) }));
+  t.mock.method(cdp, 'getFrames', async () => []);
+  t.mock.method(cdp, 'pickContentFrame', async () => ({ contextId: 1 }));
+  t.mock.method(cdp, 'evaluate', async () => ({ turns: [], running: false }));
+
+  const w = new SessionWatcher('sid', (e) => sent.push(e));
+  t.after(() => w.close());
+  await w.start();
+  assert.strictEqual(w.attachFailed, true);
+
+  up = true;
+  await w._tick(); // reattaches
+  assert.strictEqual(w.attachFailed, false, 'the flag clears so a later outage is visible');
 });

@@ -618,5 +618,38 @@ class CdpStateTests(AioHTTPTestCase, IsolatedState):
         self.assertEqual(body["sessions"], [])
         await ws.close()
 
+
+class PingTests(AioHTTPTestCase, IsolatedState):
+    """The daemon's own liveness probe. Protocol-level ping/pong is handled
+    below its WebSocket API and never reaches its code, so a black-holed
+    connection needs an answer the daemon can observe."""
+
+    async def get_application(self):
+        return server.make_app()
+
+    def setUp(self):
+        IsolatedState.setUp(self)
+        AioHTTPTestCase.setUp(self)
+        server.client_ws = None
+        server.client_authed = False
+        self.addCleanup(lambda: setattr(server, "client_ws", None))
+        self.addCleanup(lambda: setattr(server, "client_authed", False))
+
+    async def test_ping_is_answered_with_pong(self):
+        ws = await self.client.ws_connect("/ws/client")
+        await ws.send_json({"type": "hello", "token": TOKEN})
+        self.assertEqual((await asyncio.wait_for(ws.receive_json(), timeout=5))["type"], "auth_ok")
+        await ws.send_json({"type": "ping"})
+        reply = await asyncio.wait_for(ws.receive_json(), timeout=5)
+        self.assertEqual(reply, {"type": "pong"})
+        await ws.close()
+
+    async def test_ping_before_hello_is_ignored_like_any_other_traffic(self):
+        ws = await self.client.ws_connect("/ws/client")
+        await ws.send_json({"type": "ping"})
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(ws.receive_json(), timeout=0.3)
+        await ws.close()
+
 if __name__ == "__main__":
     unittest.main()

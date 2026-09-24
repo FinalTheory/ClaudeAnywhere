@@ -344,6 +344,15 @@ async def ws_client_handler(request: web.Request) -> web.WebSocketResponse:
         if not client_authed:
             continue
 
+        if mtype == "ping":
+            # The daemon's own liveness probe. A changed wifi route can
+            # black-hole an established connection with no close on either
+            # side; protocol-level ping/pong is handled below the daemon's
+            # WebSocket API and never reaches its code, so it needs an
+            # answer it can actually observe.
+            await ws.send_json({"type": "pong"})
+            continue
+
         if mtype == "sessions_result":
             fut = pending_requests.pop(data.get("reqId"), None)
             if fut and not fut.done():

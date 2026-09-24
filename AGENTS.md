@@ -70,6 +70,35 @@ Three places have earned scrutiny, because each has produced a visible defect:
    of those makes the composer unusable (a DOM teardown drops the iOS text
    selection). Patch the changed turn; do not rebuild.
 
+## Staying connected
+
+The daemon must keep trying to reach the VPS for as long as the laptop has
+network, whatever 9222 is doing. The failures that matter are the silent
+ones — the process alive and no longer trying — because `node --watch`
+does **not** restart after a crash either: it prints "Waiting for file
+changes" and sits there until someone edits a file.
+
+- **Two things can kill a connection without saying so.** A suspend leaves
+  TCP half-open, and a wifi route change can black-hole an established
+  socket; in both cases `readyState` stays OPEN and no `close` fires.
+  `watchConnection` covers both: a wall-clock gap past `WAKE_GAP_MS` means
+  the process was frozen, and inbound silence past `DEAD_AFTER_MS` means
+  the socket is dead. The server's protocol-level ping is answered below
+  the WebSocket API and never reaches daemon code, which is why the
+  application-level `ping`/`pong` exists.
+- **`forceReconnect` abandons the socket rather than waiting for a close
+  that may never come**, and the generation counter stops a socket that
+  comes back to life minutes later from dialling on top of the live one.
+- **CDP being down must never cost the VPS link.** Listing returns
+  `cdp: "unreachable"` and the phone says VS Code is not running; a
+  subscribe that cannot attach keeps its watcher and lets the poll loop
+  retry, because deleting it meant the session never recovered. Attach
+  failures report once per outage, not once per poll.
+- **The deploy watcher is optional and must not be able to take the bridge
+  down.** An `FSWatcher` with no `error` listener exits the process.
+- Anything reached from an async event listener needs a `catch`. An
+  unhandled rejection there is rethrown on the next tick and is fatal.
+
 ## Scraping someone else's DOM
 
 Everything here reads a closed-source extension's markup, so the question

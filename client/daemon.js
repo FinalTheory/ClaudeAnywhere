@@ -331,6 +331,7 @@ class SessionWatcher {
     this.lastSessionUuid = null;
     this.lastResyncAt = 0;
     this.reportedMismatch = false;
+    this.attachFailed = false;
     this.timer = null;
     this.closed = false;
     // Every fresh subscribe (including after a daemon process restart, which
@@ -357,8 +358,28 @@ class SessionWatcher {
   }
 
   async start() {
-    await this.attach();
+    try {
+      await this.attach();
+    } catch (err) {
+      // Do not give up on the subscription. The poll loop reattaches on
+      // every failure, so the only thing a failed first attach needs is
+      // for the loop to exist — deleting the watcher here meant a
+      // subscribe that arrived while 9222 was down never polled again,
+      // even after VS Code came back. That is reachable on every wake:
+      // the daemon redials in ~5s and the server immediately re-issues
+      // subscribe for whatever the phone still has open, usually before
+      // VS Code's debug port is listening.
+      this._reportAttachFailure(err);
+    }
     this._scheduleNext(0);
+  }
+
+  // Once per outage, not once per poll: while 9222 is down this would
+  // otherwise put an error on the wire every POLL_INTERVAL_MS.
+  _reportAttachFailure(err) {
+    if (this.attachFailed) return;
+    this.attachFailed = true;
+    this.onEvent({ type: 'error', sessionId: this.sessionId, message: err.message });
   }
 
   _scheduleNext(delay) {
@@ -409,8 +430,9 @@ class SessionWatcher {
       }
       try {
         await this.attach();
+        this.attachFailed = false; // back in business; report the next outage
       } catch (reattachErr) {
-        this.onEvent({ type: 'error', sessionId: this.sessionId, message: reattachErr.message });
+        this._reportAttachFailure(reattachErr);
       }
     }
     this._scheduleNext(POLL_INTERVAL_MS);
@@ -472,6 +494,20 @@ class Daemon {
     // conversation is on screen. Fills in as tabs are switched; lost on
     // restart, which costs a nicer label and nothing else.
     this.learnedTitles = new Map();
+    // When the VPS was last heard from at all. Any inbound frame counts,
+    // including the pong; see watchConnection.
+    this.lastInboundAt = 0;
+  }
+
+  // ms since the VPS last said anything, or null when there is no socket
+  // to have heard it on.
+  msSinceInbound() {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.lastInboundAt) return null;
+    return Date.now() - this.lastInboundAt;
+  }
+
+  ping() {
+    this._send({ type: 'ping' });
   }
 
   connect() {
@@ -481,6 +517,7 @@ class Daemon {
     this.ws.addEventListener('open', () => {
       console.error('Connected — authenticating...');
       this.reconnectDelay = 1000;
+      this.lastInboundAt = Date.now(); // the deadline starts now, not at 0
       this._send({ type: 'hello', token: AUTH_TOKEN });
     });
     this.ws.addEventListener('message', (ev) => {
@@ -491,6 +528,7 @@ class Daemon {
       // ECONNREFUSED 127.0.0.1:9222 and the rejection escaped. Nothing
       // arriving here is worth dying for; the VPS link and the poll loops
       // both recover on their own.
+      this.lastInboundAt = Date.now();
       this._handleMessage(ev.data).catch((err) => {
         console.error(`Error handling ${msgType(ev.data)}: ${err.message}`);
       });
@@ -552,6 +590,8 @@ class Daemon {
       process.exit(1);
     }
 
+    if (msg.type === 'pong') return; // liveness only; lastInboundAt is the payload
+
     if (msg.type === 'auth_ok') {
       console.error('Authenticated. Waiting for commands.');
       return;
@@ -567,13 +607,11 @@ class Daemon {
       if (this.watchers.has(msg.sessionId)) return;
       const watcher = new SessionWatcher(msg.sessionId, (event) => this._send(event));
       this.watchers.set(msg.sessionId, watcher);
-      try {
-        await watcher.start();
-        console.error(`Subscribed: ${msg.sessionId}`);
-      } catch (err) {
-        this._send({ type: 'error', sessionId: msg.sessionId, message: err.message });
-        this.watchers.delete(msg.sessionId);
-      }
+      // start() no longer throws: a failed first attach reports itself and
+      // leaves the poll loop running, so the subscription survives 9222
+      // being temporarily down.
+      await watcher.start();
+      console.error(`Subscribed: ${msg.sessionId}`);
       return;
     }
 
@@ -740,14 +778,39 @@ class Daemon {
 const WAKE_PROBE_MS = 5000;
 const WAKE_GAP_MS = 30000; // generous: normal event-loop lag is milliseconds
 
-function watchForWake(daemon) {
+// The other way a connection dies without saying so. Changing wifi can
+// black-hole an established TCP connection: no FIN, no RST, readyState
+// stays OPEN, and _send writes into nothing. Unlike a suspend there is no
+// wall-clock gap to notice, so the wake check above cannot see it, and
+// the server's protocol-level ping is answered by the WebSocket layer
+// without ever reaching this code. Nothing else bounds the outage — the
+// OS gives up on the socket eventually, but that is many minutes.
+//
+// So: say something periodically and require an answer. PING_EVERY_MS is
+// well under DEAD_AFTER_MS so an ordinary lost packet does not trip it.
+const PING_EVERY_MS = 20000;
+const DEAD_AFTER_MS = 60000;
+
+function watchConnection(daemon) {
   let last = Date.now();
+  let lastPing = 0;
   const timer = setInterval(() => {
     const now = Date.now();
     const gap = now - last;
     last = now;
     if (gap > WAKE_GAP_MS) {
       daemon.forceReconnect(`Host was suspended for ~${Math.round(gap / 1000)}s`);
+      return; // already redialling; the silence below is expected
+    }
+    const quiet = daemon.msSinceInbound();
+    if (quiet === null) return; // not connected; the reconnect loop owns this
+    if (quiet > DEAD_AFTER_MS) {
+      daemon.forceReconnect(`No answer from the VPS for ${Math.round(quiet / 1000)}s`);
+      return;
+    }
+    if (now - lastPing >= PING_EVERY_MS) {
+      lastPing = now;
+      daemon.ping();
     }
   }, WAKE_PROBE_MS);
   timer.unref && timer.unref(); // never hold the process open on its own
@@ -786,10 +849,21 @@ function deploySync() {
 function startDeployWatch() {
   console.error(`[deploy] watching ${DEPLOY_WATCH_DIR} -> ${DEPLOY_TARGET}`);
   deploySync(); // push current state on start, not just on the next edit
-  fs.watch(DEPLOY_WATCH_DIR, { recursive: true }, () => {
-    clearTimeout(deployTimer);
-    deployTimer = setTimeout(deploySync, DEPLOY_DEBOUNCE_MS);
-  });
+  // An FSWatcher is an EventEmitter, so an unhandled 'error' — watch root
+  // moved, replaced, unmounted, or a descriptor limit — is rethrown and
+  // exits the process. Deploying is an optional convenience; the VPS
+  // bridge is the point. Losing the first must not cost the second.
+  try {
+    const watcher = fs.watch(DEPLOY_WATCH_DIR, { recursive: true }, () => {
+      clearTimeout(deployTimer);
+      deployTimer = setTimeout(deploySync, DEPLOY_DEBOUNCE_MS);
+    });
+    watcher.on('error', (err) => {
+      console.error(`[deploy] watcher stopped: ${err.message} — edits will no longer deploy`);
+    });
+  } catch (err) {
+    console.error(`[deploy] could not watch ${DEPLOY_WATCH_DIR}: ${err.message}`);
+  }
 }
 
 // Run as a program: install file logging, check env, connect, optionally
@@ -802,7 +876,7 @@ if (require.main === module) {
   requireEnv();
   const daemon = new Daemon();
   daemon.connect();
-  watchForWake(daemon);
+  watchConnection(daemon);
   if (DEPLOY_TARGET) startDeployWatch();
 }
 
@@ -810,9 +884,11 @@ module.exports = {
   shouldEmitNow,
   RESYNC_MIN_INTERVAL_MS,
   resolveTitles,
-  watchForWake,
+  watchConnection,
   WAKE_PROBE_MS,
   WAKE_GAP_MS,
+  PING_EVERY_MS,
+  DEAD_AFTER_MS,
   diffTurns,
   arraysEqual,
   stripTags,
