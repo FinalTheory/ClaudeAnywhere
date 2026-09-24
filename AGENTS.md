@@ -165,6 +165,25 @@ When you add a test, prove it can fail: reintroduce the defect, confirm the test
 fails, restore. Assert the mutation target exists before writing it — a
 no-op mutation leaves the suite green, which reads exactly like success.
 
+**Take the pre-mutation copy from git, not from the working tree, and
+confirm the restore with `git diff` rather than trusting the copy back.**
+A mutation run that exceeds the command timeout is moved to the
+background and can be killed between editing and restoring; a later
+`cp working-tree backup` then captures the damage as the baseline and
+propagates it. That has happened — `if mtype == "action_result":` survived
+as `if False:` across two commands, and what caught it was a `git diff`
+looking for leftovers, not the restore itself.
+
+**A DOM expression must be proved to parse, not just to be a valid
+string.** These are built inside template literals and evaluated in a
+browser, so a backslash is consumed twice: `\/` in the source reaches the
+page as `/`, which turns `/^\//` into `/^//` and makes the whole
+expression a syntax error at the moment it runs. `node --check` sees a
+perfectly good string, and the failure surfaces as an opaque CDP
+exception on someone's phone. One test evaluates every expression with
+`new Function`, including the generated ones against an argument full of
+quotes, backslashes and `${}`.
+
 ## Conventions
 
 - Commits follow `eviworkspace`'s: `<type>(<scope>): [skip jira] <subject>`.

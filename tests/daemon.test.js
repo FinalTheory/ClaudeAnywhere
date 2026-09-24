@@ -9,6 +9,7 @@ const assert = require('node:assert');
 
 const cdp = require('../cdp-client.js');
 const {
+  CLICK_MCP_COMMAND_EXPR,
   clickByText,
   clickServerRow,
   clickReconnectFor,
@@ -1091,4 +1092,99 @@ test('clickByText: an in-flight Reconnecting… is not mistaken for Reconnect', 
   const out = runExpr(clickByText('actionButton_', 'Reconnect'), dom);
   assert.strictEqual(out.ok, false);
   assert.strictEqual(dom.els[0].clicked, 0);
+});
+
+// --- picking /mcp out of the command menu ---------------------------------
+// The first attempt opened the menu with its button and looked for an item
+// whose text was exactly "/mcp". It failed with "no /mcp entry", which is
+// why the matching is now tolerant and a failure reports the labels.
+
+test('CLICK_MCP_COMMAND_EXPR: matches the label however it is written', () => {
+  for (const label of ['/mcp', 'mcp', '/mcp ', '/MCP']) {
+    const dom = fakeDom([
+      { cls: 'commandItem_G_S7FQ', text: '', children: { commandLabel_: '/clear' } },
+      { cls: 'commandItem_G_S7FQ', text: '', children: { commandLabel_: label } },
+    ]);
+    const out = runExpr(CLICK_MCP_COMMAND_EXPR, dom);
+    assert.strictEqual(out.ok, true, `label ${JSON.stringify(label)}`);
+    assert.deepStrictEqual(dom.els.map((e) => e.clicked), [0, 1]);
+  }
+});
+
+test('CLICK_MCP_COMMAND_EXPR: ignores a longer command that merely starts with mcp', () => {
+  // A loose startsWith would click the wrong command; the label is
+  // compared as its first whitespace-delimited token.
+  const dom = fakeDom([
+    { cls: 'commandItem_G_S7FQ', text: '', children: { commandLabel_: '/mcp-debug' } },
+  ]);
+  const out = runExpr(CLICK_MCP_COMMAND_EXPR, dom);
+  assert.strictEqual(out.ok, false);
+  assert.strictEqual(dom.els[0].clicked, 0);
+});
+
+test('CLICK_MCP_COMMAND_EXPR: a miss reports the labels it saw', () => {
+  // The only way the next attempt is informed rather than another guess.
+  const dom = fakeDom([
+    { cls: 'commandItem_G_S7FQ', text: '', children: { commandLabel_: '/clear' } },
+    { cls: 'commandItem_G_S7FQ', text: '', children: { commandLabel_: '/compact' } },
+  ]);
+  const out = runExpr(CLICK_MCP_COMMAND_EXPR, dom);
+  assert.strictEqual(out.ok, false);
+  assert.deepStrictEqual(out.seen, ['/clear', '/compact']);
+});
+
+test('CLICK_MCP_COMMAND_EXPR: takes the label child, not the whole row text', () => {
+  // The row also carries a description; matching on row text would miss.
+  const dom = fakeDom([
+    {
+      cls: 'commandItem_G_S7FQ',
+      text: '/mcp Manage MCP servers and authentication',
+      children: { commandLabel_: '/mcp' },
+    },
+  ]);
+  assert.strictEqual(runExpr(CLICK_MCP_COMMAND_EXPR, dom).ok, true);
+});
+
+// --- every DOM expression must at least parse -----------------------------
+// These are strings assembled inside template literals and evaluated in a
+// browser, so a backslash is processed twice: `\/` in the source reaches
+// the page as `/`, which turned the regex /^\// into /^// and made the
+// whole expression a syntax error at the moment it ran. Nothing upstream
+// catches that — `node --check` sees a valid string, and the failure
+// surfaces as an unhelpful CDP exception on someone's phone.
+
+test('every DOM expression parses as JavaScript', () => {
+  const daemon = require('../client/daemon.js');
+  const fixed = [
+    'POLL_EXPR',
+    'MCP_STATE_EXPR',
+    'MENU_STATE_EXPR',
+    'CLICK_MCP_COMMAND_EXPR',
+    'CLEAR_COMPOSER_EXPR',
+    'RECONNECT_BUSY_EXPR',
+    'NEW_SESSION_EXPR',
+  ];
+  for (const name of fixed) {
+    assert.ok(daemon[name], `${name} is exported`);
+    assert.doesNotThrow(
+      // eslint-disable-next-line no-new-func
+      () => new Function('document', `return (${daemon[name]});`),
+      `${name} does not parse`,
+    );
+  }
+  // The generated ones, with arguments that carry characters worth
+  // escaping badly.
+  const nasty = 'a"b\'c\\d\ne`f${g}';
+  for (const [name, expr] of [
+    ['clickByText', daemon.clickByText('x_', nasty)],
+    ['clickServerRow', daemon.clickServerRow(nasty)],
+    ['clickReconnectFor', daemon.clickReconnectFor(nasty)],
+    ['injectExpr', daemon.injectExpr(nasty)],
+  ]) {
+    assert.doesNotThrow(
+      // eslint-disable-next-line no-new-func
+      () => new Function('document', `return (${expr});`),
+      `${name} does not parse`,
+    );
+  }
 });

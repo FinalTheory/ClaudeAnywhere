@@ -269,6 +269,23 @@ function clickReconnectFor(name) {
 `;
 }
 
+// In flight while the button reads "Reconnecting…". Settled is not proof
+// the server came back — the status badge is that — but proof the request
+// finished rather than hanging.
+const RECONNECT_BUSY_EXPR = `
+(function () {
+  const b = [...document.querySelectorAll('[class*="actionButton_"]')]
+    .find((el) => (el.textContent || '').trim().startsWith('Reconnect'));
+  const title = document.querySelector('[class*="detailTitle_"]');
+  const badge = document.querySelector('[class*="statusBadge_"]');
+  return {
+    busy: !!b && (b.textContent || '').trim() === 'Reconnecting…',
+    status: badge ? (badge.textContent || '').trim() : null,
+    title: title ? (title.textContent || '').trim() : null,
+  };
+})()
+`;
+
 // Claude Code's sidebar (purpose=webviewView) owns the New session button.
 const NEW_SESSION_EXPR = `
 (function () {
@@ -594,46 +611,97 @@ async function waitFor(run, probe, done, { timeoutMs = 8000, everyMs = 250 } = {
   return last;
 }
 
+// What the command menu is currently offering, and what is in the
+// composer. Both are needed to decide the next step, and the labels are
+// what a failure has to report — guessing at them twice was already once
+// too many.
+const MENU_STATE_EXPR = `
+(function () {
+  const items = [...document.querySelectorAll('[class*="commandItem_"]')].map((el) => {
+    const lab = el.querySelector('[class*="commandLabel_"]');
+    return ((lab || el).textContent || '').trim();
+  });
+  const box = [...document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')].pop();
+  return { items, draft: box ? (box.value !== undefined ? box.value : box.textContent) || '' : null };
+})()
+`;
+
+// The menu entry for /mcp, however it is labelled. Matched on the label
+// with a leading slash and surrounding whitespace removed, because the
+// exact rendering is not something to bet on twice.
+const CLICK_MCP_COMMAND_EXPR = `
+(function () {
+  const norm = (s) => (s || '').trim().replace(/^[/]/, '').toLowerCase();
+  const items = [...document.querySelectorAll('[class*="commandItem_"]')];
+  const hit = items.find((el) => {
+    const lab = el.querySelector('[class*="commandLabel_"]');
+    return norm(((lab || el).textContent || '').split(/[ \\t\\n]/)[0]) === 'mcp';
+  });
+  if (!hit) {
+    return {
+      ok: false,
+      reason: 'no mcp entry in the command menu',
+      seen: items.map((el) => ((el.querySelector('[class*="commandLabel_"]') || el).textContent || '').trim()).slice(0, 20),
+    };
+  }
+  hit.click();
+  return { ok: true };
+})()
+`;
+
+// Empty the composer. Restoring a draft the phone displaced matters more
+// than it sounds: the author may have been mid-sentence on the laptop.
+const CLEAR_COMPOSER_EXPR = `
+(function () {
+  const box = [...document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')].pop();
+  if (!box) return { ok: false };
+  box.focus();
+  document.execCommand('selectAll');
+  document.execCommand('delete');
+  return { ok: true };
+})()
+`;
+
 // One attached webview, driven step by step. `run` evaluates an
 // expression in that session's content frame.
 async function openMcpPanel(run) {
   let state = await run(MCP_STATE_EXPR);
   if (state.panel !== 'none') return { ok: true, state };
 
-  // The command menu, not the composer: typing "/mcp" and pressing Enter
-  // sends it as a message instead of opening anything.
-  if (!state.menuOpen) {
-    const opened = await run(clickByText('menuButton_', 'Show command menu (/)'));
-    if (!opened.ok) {
-      // The label carries a hint in parentheses and could be reworded;
-      // fall back to the only button with that class.
-      const any = await run(`
-(function () {
-  const b = document.querySelector('[class*="menuButton_"]');
-  if (!b) return { ok: false, reason: 'no command menu button' };
-  b.click();
-  return { ok: true };
-})()
-`);
-      if (!any.ok) return { ok: false, error: any.reason };
-    }
+  // Type "/mcp" rather than opening the menu with its button. The menu
+  // filters on what is in the composer, and opening it cold lists every
+  // command — which is where the first attempt failed, reporting no mcp
+  // entry. This is also the path that is known to work, because it is the
+  // one a person uses.
+  //
+  // No Enter at any point: Enter sends "/mcp" as a message instead of
+  // opening the panel.
+  const before = await run(MENU_STATE_EXPR);
+  const draft = before.draft || '';
+  if (draft) await run(CLEAR_COMPOSER_EXPR);
+  await run(injectExpr('/mcp'));
+
+  const menu = await waitFor(
+    run,
+    MENU_STATE_EXPR,
+    (st) => st.items.some((label) => label.trim().replace(/^\//, '').toLowerCase().startsWith('mcp')),
+    { timeoutMs: 5000 },
+  );
+  if (!menu.items.length) {
+    await run(CLEAR_COMPOSER_EXPR);
+    if (draft) await run(injectExpr(draft));
+    return { ok: false, error: 'typing /mcp opened no command menu' };
   }
 
-  const menu = await waitFor(run, MCP_STATE_EXPR, (st) => st.menuOpen, { timeoutMs: 4000 });
-  if (!menu.menuOpen) return { ok: false, error: 'the command menu did not open' };
-
-  const picked = await run(clickByText('commandItem_', '/mcp'));
+  const picked = await run(CLICK_MCP_COMMAND_EXPR);
+  // Either way the composer goes back to how it was found.
+  await run(CLEAR_COMPOSER_EXPR);
+  if (draft) await run(injectExpr(draft));
   if (!picked.ok) {
-    const alt = await run(`
-(function () {
-  const item = [...document.querySelectorAll('[class*="commandItem_"]')]
-    .find((el) => ((el.querySelector('[class*="commandLabel_"]') || el).textContent || '').trim().startsWith('/mcp'));
-  if (!item) return { ok: false, reason: 'no /mcp entry in the command menu' };
-  item.click();
-  return { ok: true };
-})()
-`);
-    if (!alt.ok) return { ok: false, error: alt.reason };
+    return {
+      ok: false,
+      error: `${picked.reason}${picked.seen && picked.seen.length ? ` (menu showed: ${picked.seen.join(', ')})` : ''}`,
+    };
   }
 
   state = await waitFor(run, MCP_STATE_EXPR, (st) => st.panel !== 'none');
@@ -686,24 +754,7 @@ async function reconnectMcpServer(run, name) {
   // The button reads "Reconnecting…" while in flight; settled is when it
   // is gone. Not proof the server came back — the status badge is — but
   // proof the request completed rather than hanging.
-  await waitFor(
-    run,
-    `
-(function () {
-  const b = [...document.querySelectorAll('[class*="actionButton_"]')]
-    .find((el) => (el.textContent || '').trim().startsWith('Reconnect'));
-  const title = document.querySelector('[class*="detailTitle_"]');
-  const badge = document.querySelector('[class*="statusBadge_"]');
-  return {
-    busy: !!b && (b.textContent || '').trim() === 'Reconnecting…',
-    status: badge ? (badge.textContent || '').trim() : null,
-    title: title ? (title.textContent || '').trim() : null,
-  };
-})()
-`,
-    (st) => !st.busy,
-    { timeoutMs: 20000 },
-  );
+  await waitFor(run, RECONNECT_BUSY_EXPR, (st) => !st.busy, { timeoutMs: 20000 });
   const after = await run(MCP_STATE_EXPR);
   await closeMcpPanel(run);
   return { ok: true, status: after.title === name ? 'reconnected' : 'done' };
@@ -1235,6 +1286,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+  CLEAR_COMPOSER_EXPR,
+  RECONNECT_BUSY_EXPR,
+  CLICK_MCP_COMMAND_EXPR,
+  MENU_STATE_EXPR,
   openMcpPanel,
   readMcpServers,
   reconnectMcpServer,
