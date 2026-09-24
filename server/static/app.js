@@ -129,6 +129,7 @@ function connectPhoneWs(sessionId, delay) {
       renderWindow(msg.turns, msg.startIndex);
       setStatus(msg.running);
       scrollToBottom(true);
+      fillViewport();
     } else if (msg.type === 'append') {
       // NOT `+=` — `el.innerHTML += x` is `el.innerHTML = el.innerHTML + x`,
       // which tears down and reparses EVERY existing child, not just adds
@@ -139,10 +140,10 @@ function connectPhoneWs(sessionId, delay) {
       applyCollapse();
       scrollToBottom(stick);
     } else if (msg.type === 'resync') {
-      // Server already truncated this to the same tail-window size as
-      // `initial` (see server.py) — treat it identically: reset the
-      // pagination cursor too, or scrolling up next would fetch history
-      // using a cursor computed against content that no longer exists.
+      // The server truncates this to the same tail window `initial` gets
+      // (see server.py), so it describes the newest turns, not the whole
+      // conversation. applyResyncWindow decides whether that is a patch,
+      // a suffix replacement, or a reset.
       applyResyncWindow(msg.turns, msg.startIndex);
       scrollToBottom(stick);
     } else if (msg.type === 'state') {
@@ -243,6 +244,32 @@ function applyResyncWindow(turns, startIndex) {
     }
     return;
   }
+
+  // Scrolled back. The window describes a suffix of what is on screen, so
+  // replace that suffix and keep everything paged in above it. Resetting
+  // to the window instead — which is what a resync used to mean — threw
+  // all of it away, and since a resync lands every few seconds while a
+  // reply streams, scrolling back during a live conversation was
+  // impossible: the view snapped to the last turn before you could read.
+  //
+  // loadedStartIndex and hasMore stay put on purpose: the older turns are
+  // still displayed, so the pagination cursor still describes the view.
+  // Scroll position is preserved for free, because nothing above the
+  // splice point moves.
+  const offset = startIndex - loadedStartIndex;
+  if (offset > 0 && offset < n) {
+    while (transcriptEl.children.length > offset) {
+      transcriptEl.lastElementChild.remove();
+    }
+    transcriptEl.insertAdjacentHTML('beforeend', turns.join(''));
+    renderedTurns = renderedTurns.slice(0, offset).concat(turns);
+    // Markers are not carried across here as they are in the fast path
+    // above: the replaced suffix is the live exchange, and someone
+    // scrolled back is reading the older turns, which are untouched.
+    applyCollapse();
+    return;
+  }
+
   renderWindow(turns, startIndex);
 }
 
@@ -346,8 +373,26 @@ function scrollToBottom(force) {
 // response, silently skipping or re-fetching a range.
 let loadingMore = false;
 
-transcriptEl.addEventListener('scroll', async () => {
-  if (transcriptEl.scrollTop > 40 || !hasMore || !currentSessionId || loadingMore) return;
+// Pagination is driven by scrolling, so a window that does not overflow
+// has no way to ask for more — the scroll event never fires and the older
+// turns are unreachable. The initial window is one whole turn, which is
+// usually several screens but need not be.
+async function fillViewport() {
+  for (let guard = 0; guard < 5; guard++) {
+    if (!hasMore || transcriptEl.scrollHeight > transcriptEl.clientHeight) return;
+    const before = loadedStartIndex;
+    await loadOlder();
+    if (loadedStartIndex === before) return; // nothing moved; stop asking
+  }
+}
+
+transcriptEl.addEventListener('scroll', () => {
+  if (transcriptEl.scrollTop > 40) return;
+  loadOlder();
+});
+
+async function loadOlder() {
+  if (!hasMore || !currentSessionId || loadingMore) return;
   loadingMore = true;
   // What this page was asked for. A resync can land while the request is
   // in flight and reset the whole window to a newer tail; applying the
@@ -378,7 +423,7 @@ transcriptEl.addEventListener('scroll', async () => {
   } finally {
     loadingMore = false;
   }
-});
+}
 
 // Coming back to a backgrounded tab. iOS suspends the page rather than
 // closing it, so the socket can be dead with no close event delivered
