@@ -135,6 +135,19 @@ test('pickUniquePair: nothing on screen is null, not a throw', () => {
 
 // --- a request in flight when the debug socket dies ----------------------
 
+// Bounded, and returns the rejection rather than asserting on it. The
+// defect here is a promise that never settles, so awaiting it plainly
+// signals by hanging until the runner's timeout — which reads as a stuck
+// suite rather than a failed assertion, and takes the whole file down
+// with it.
+async function settle(promise) {
+  const out = await Promise.race([
+    promise.then((v) => new Error(`resolved with ${JSON.stringify(v)} instead of rejecting`), (e) => e),
+    new Promise((r) => setTimeout(() => r(new Error('never settled')), 60)),
+  ]);
+  return out;
+}
+
 function fakeSocket() {
   const listeners = new Map();
   return {
@@ -171,7 +184,7 @@ test('send: a request outstanding when the socket closes is rejected, not abando
   const send = makeSend(ws);
   const pending = send('Runtime.evaluate', { expression: '1' });
   ws.fire('close', {});
-  await assert.rejects(pending, /socket closed with requests in flight/);
+  assert.match((await settle(pending)).message, /socket closed with requests in flight/);
 });
 
 test('send: an errored socket settles everything in flight', async () => {
@@ -180,8 +193,8 @@ test('send: an errored socket settles everything in flight', async () => {
   const a = send('A');
   const b = send('B');
   ws.fire('error', {});
-  await assert.rejects(a, /errored with requests in flight/);
-  await assert.rejects(b, /errored with requests in flight/);
+  assert.match((await settle(a)).message, /errored with requests in flight/);
+  assert.match((await settle(b)).message, /errored with requests in flight/);
 });
 
 test('send: a reply still resolves, and leaves no listener behind', async () => {
@@ -205,6 +218,6 @@ test('send: sending on an already-dead socket rejects instead of hanging', async
   ws.send = () => {
     throw new Error('WebSocket is not open');
   };
-  await assert.rejects(send('Runtime.evaluate', {}), /not open/);
+  assert.match((await settle(send('Runtime.evaluate', {}))).message, /not open/);
   assert.strictEqual(ws.count('message'), 0, 'and does not leak its listener');
 });
