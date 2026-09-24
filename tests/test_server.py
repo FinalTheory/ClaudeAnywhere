@@ -727,6 +727,41 @@ class ActionRouteTests(AioHTTPTestCase, IsolatedState):
         self.assertEqual(body["sessionId"], "new-1")
         await ws.close()
 
+    async def test_two_actions_in_flight_each_get_their_own_answer(self):
+        """reqId is what routes a reply, and with one request outstanding
+        any pop at all looks correct. Replying out of order is the only
+        arrangement that tells the difference."""
+        ws = await self.client.ws_connect("/ws/client")
+        await ws.send_json({"type": "hello", "token": TOKEN})
+        await asyncio.wait_for(ws.receive_json(), timeout=5)
+
+        first = asyncio.create_task(
+            self.client.post("/api/new-session", json={"text": "one"}, headers=AUTH_HEADER)
+        )
+        req_one = await asyncio.wait_for(ws.receive_json(), timeout=5)
+        second = asyncio.create_task(
+            self.client.post("/api/new-session", json={"text": "two"}, headers=AUTH_HEADER)
+        )
+        req_two = await asyncio.wait_for(ws.receive_json(), timeout=5)
+
+        self.assertEqual(req_one["text"], "one")
+        self.assertEqual(req_two["text"], "two")
+        self.assertNotEqual(req_one["reqId"], req_two["reqId"])
+
+        # Reverse order: the second request is answered first.
+        await ws.send_json(
+            {"type": "action_result", "reqId": req_two["reqId"], "ok": True, "sessionId": "for-two"}
+        )
+        await ws.send_json(
+            {"type": "action_result", "reqId": req_one["reqId"], "ok": True, "sessionId": "for-one"}
+        )
+
+        body_one = await (await asyncio.wait_for(first, timeout=5)).json()
+        body_two = await (await asyncio.wait_for(second, timeout=5)).json()
+        self.assertEqual(body_one["sessionId"], "for-one")
+        self.assertEqual(body_two["sessionId"], "for-two")
+        await ws.close()
+
     async def test_a_failed_action_is_200_with_the_reason(self):
         # The laptop answered; what it said is the useful part. A 5xx here
         # would read as the VPS being broken.

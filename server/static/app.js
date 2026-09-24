@@ -165,6 +165,15 @@ newSessionInput.addEventListener('input', () => {
 
 function renderMcp(out) {
   mcpListEl.innerHTML = '';
+  // The daemon borrows the laptop composer to type "/mcp" and puts it
+  // back. When it could not, it says so here — the action still worked,
+  // but there is something left on the laptop screen to deal with.
+  if (out.note) {
+    const n = document.createElement('p');
+    n.className = 'action-status bad';
+    n.textContent = out.note;
+    mcpListEl.appendChild(n);
+  }
   if (!out.ok) {
     const p = document.createElement('p');
     p.className = 'action-status bad';
@@ -207,8 +216,8 @@ function renderMcp(out) {
           // status sentence when it clicked but never saw the reconnect
           // start, and refreshing straight past it would present a
           // guess as a result.
-          if (res.status && !/^reconnected/.test(res.status)) {
-            status.textContent = res.status;
+          if (res.note || (res.status && !/^reconnected/.test(res.status))) {
+            status.textContent = [res.status, res.note].filter(Boolean).join(' · ');
             status.className = 'mcp-status bad';
             return;
           }

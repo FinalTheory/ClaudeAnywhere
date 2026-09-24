@@ -37,6 +37,8 @@ const {
   SessionWatcher,
   MAX_RESYNC_TURNS,
   CMD_MODIFIER,
+  readMcpServers,
+  reconnectMcpServer,
 } = require('../client/daemon.js');
 
 // --- diffTurns: the wire decision ----------------------------------------
@@ -1040,6 +1042,57 @@ test('clickReconnectFor: clicks once the title matches', () => {
   assert.deepStrictEqual(dom.els.map((e) => e.clicked), [0, 0, 1, 0]);
 });
 
+test('clickReconnectFor: the hop cap is not a containment proof', () => {
+  // The title sits deeper than the walk can climb, so the loop runs out
+  // of hops rather than finding the panel. Reading a non-null `panel` as
+  // "found it" clicks a Reconnect the title was never shown to own.
+  const mkEl = (className, textContent, kids) => {
+    const el = {
+      className,
+      textContent,
+      disabled: false,
+      clicked: 0,
+      kids: kids || [],
+      click() { this.clicked++; },
+      getAttribute: () => null,
+      contains(other) {
+        if (other === this) return true;
+        return this.kids.some((k) => k.contains(other));
+      },
+      querySelectorAll(sel) {
+        const want = sel.match(/class\*="([^"]+)"/)[1];
+        const out = [];
+        const walk = (n) => {
+          for (const k of n.kids) {
+            if (k.className.includes(want)) out.push(k);
+            walk(k);
+          }
+        };
+        walk(this);
+        return out;
+      },
+      querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
+    };
+    for (const k of el.kids) k.parentElement = el;
+    return el;
+  };
+  const title = mkEl('detailTitle_IHCQeQ', 'jira-ghe');
+  // Twelve wrappers: more than the eight the walk is allowed.
+  let nested = title;
+  for (let i = 0; i < 12; i += 1) nested = mkEl(`wrap_${i}`, '', [nested]);
+  const btn = mkEl('actionButton_IHCQeQ', 'Reconnect');
+  const actions = mkEl('detailActions_IHCQeQ', '', [btn]);
+  const root = mkEl('root', '', [nested, actions]);
+  const doc = {
+    querySelectorAll: (sel) => root.querySelectorAll(sel),
+    querySelector: (sel) => root.querySelector(sel),
+  };
+  const out = runExpr(clickReconnectFor('jira-ghe'), doc);
+  assert.strictEqual(out.ok, false);
+  assert.match(out.reason, /not the actions it belongs to/);
+  assert.strictEqual(btn.clicked, 0);
+});
+
 test('clickReconnectFor: refuses when there is no detail view at all', () => {
   const dom = fakeDom([{ cls: 'actionButton_IHCQeQ', text: 'Reconnect' }]);
   const out = runExpr(clickReconnectFor('jira-ghe'), dom);
@@ -1501,6 +1554,39 @@ test('SessionQueue: a long action marks the session busy, a short one does not',
   });
 });
 
+test('SessionQueue: a second long action is refused, not queued behind the first', async () => {
+  // A Set holds one entry per session however many holders it has. Two
+  // overlapping long actions share it, and the first to finish clears it
+  // while the second is still driving the composer — isBusy then reports
+  // idle and a submit types into the middle of an MCP flow.
+  const q = new SessionQueue();
+  let released;
+  const first = q.runLong('s', () => new Promise((r) => { released = r; }));
+  const second = await q.runLong('s', async () => {
+    throw new Error('the second action must not run');
+  });
+  assert.strictEqual(second.ok, false);
+  assert.match(second.error, /already driving Claude Code/);
+  assert.strictEqual(q.isBusy('s'), true, 'the refusal did not disturb the holder');
+
+  released();
+  await first;
+  assert.strictEqual(q.isBusy('s'), false);
+  // And the refusal must not have consumed the session's turn.
+  assert.strictEqual((await q.runLong('s', async () => ({ ok: true }))).ok, true);
+});
+
+test('SessionQueue: the first long action still holds the session after a refusal', async () => {
+  const q = new SessionQueue();
+  let released;
+  const first = q.runLong('s', () => new Promise((r) => { released = r; }));
+  await q.runLong('s', async () => ({ ok: true }));
+  // The refused caller's finally must not have cleared the holder's flag.
+  assert.strictEqual(q.isBusy('s'), true);
+  released();
+  await first;
+});
+
 test('SessionQueue: busy clears even when the long action throws', async () => {
   const q = new SessionQueue();
   await assert.rejects(() => q.runLong('s', async () => { throw new Error('boom'); }));
@@ -1610,6 +1696,55 @@ test('newSession: two new conversations at once refuses to type into either', as
   assert.deepStrictEqual(submits, [], 'nothing was typed into anything');
 });
 
+test('newSession: a candidate that arrives alone still has to survive a poll', async (t) => {
+  // The staggered race, which the same-snapshot check cannot see. An
+  // unrelated webview mounts first and is briefly the only candidate;
+  // typing into it on that first sighting puts the phone's prompt into
+  // someone else's conversation, silently.
+  const snapshots = [
+    [{ sessionId: 'old' }],
+    [{ sessionId: 'old' }, { sessionId: 'unrelated' }],
+    [{ sessionId: 'old' }, { sessionId: 'unrelated' }, { sessionId: 'intended' }],
+  ];
+  let calls = 0;
+  t.mock.method(cdp, 'listClaudeSessions', async () =>
+    snapshots[Math.min(calls++, snapshots.length - 1)]
+  );
+  t.mock.method(cdp, 'withSidebar', async () => ({ ok: true }));
+  const d = new Daemon();
+  let typedInto = null;
+  d._typeIntoNewSession = async (id) => {
+    typedInto = id;
+    return { ok: true, sessionId: id };
+  };
+  const out = await d.newSession('hello');
+  assert.strictEqual(out.ok, false);
+  assert.match(out.error, /2 new conversations appeared at once/);
+  assert.strictEqual(typedInto, null, 'nothing was typed anywhere');
+});
+
+test('newSession: a candidate that disappears again is not used', async (t) => {
+  // A webview that mounts and closes inside the wait is not the session
+  // the New session click produced.
+  const snapshots = [
+    [{ sessionId: 'old' }],
+    [{ sessionId: 'old' }, { sessionId: 'flicker' }],
+    [{ sessionId: 'old' }],
+    [{ sessionId: 'old' }, { sessionId: 'real' }],
+    [{ sessionId: 'old' }, { sessionId: 'real' }],
+  ];
+  let calls = 0;
+  t.mock.method(cdp, 'listClaudeSessions', async () =>
+    snapshots[Math.min(calls++, snapshots.length - 1)]
+  );
+  t.mock.method(cdp, 'withSidebar', async () => ({ ok: true }));
+  const d = new Daemon();
+  d._typeIntoNewSession = async (id) => ({ ok: true, sessionId: id });
+  const out = await d.newSession('hello');
+  assert.strictEqual(out.ok, true);
+  assert.strictEqual(out.sessionId, 'real');
+});
+
 test('newSession: exactly one new conversation is used', async (t) => {
   let calls = 0;
   t.mock.method(cdp, 'listClaudeSessions', async () =>
@@ -1627,29 +1762,57 @@ test('newSession: exactly one new conversation is used', async (t) => {
 // then a command menu once /mcp is typed, then a list once the entry is
 // clicked. A fake that reports the panel already open would take the
 // early return and prove nothing.
-function fakeMcpRun({ draft = '', clearFails = false, restoreFails = false }) {
+function fakeMcpRun({ draft = '', clearFails = false, restoreFails = false, injectIgnored = false, rowClickFails = false }) {
   let opened = false;
+  // The composer is modelled, not scripted. Scripting each call's answer
+  // means a test can assert "the restore reported ok" while the modelled
+  // editor holds "/mcphello" — the defect the restore path exists to
+  // prevent — and stay green. clearFails: 'restore' fails only the
+  // cleanup clear, since a failing first clear aborts before anything
+  // has been typed and never reaches the interesting path.
+  let composer = draft;
+  // Distinct from `opened`, which gates the command menu: the panel is
+  // opened once and closed again on the way out, and a fake that never
+  // closes spends the close timeout on every call.
+  let panelOpen = false;
   return async (expr) => {
     if (expr.includes('commandItem_') && expr.includes('draft')) {
-      return { items: opened ? [] : ['/mcp'], draft, structured: false };
+      return { items: opened ? [] : ['/mcp'], draft: composer, structured: false };
     }
     if (expr.includes('serverItem_')) {
-      return opened
+      return panelOpen
         ? { panel: 'list', title: null, rows: [], menuOpen: false }
         : { panel: 'none', title: null, rows: [], menuOpen: false };
     }
+    if (expr.includes('iconButton_') || expr.includes("'close'")) {
+      panelOpen = false;
+      return { ok: true };
+    }
+    // After the MCP_STATE branch above, which also mentions serverName_.
+    if (rowClickFails && expr.includes('serverName_')) {
+      return { ok: false, reason: 'no server called that', seen: ['github'] };
+    }
     if (expr.includes('commandLabel_')) {
       opened = true;
+      panelOpen = true;
       return { ok: true };
     }
     // insertText first: injectExpr contains both insertText and
     // execCommand, so checking execCommand first makes every injection
     // look like a clear.
     if (expr.includes('insertText')) {
-      return restoreFails ? { ok: false, reason: 'no input candidates found' } : { ok: true };
+      if (restoreFails) return { ok: false, reason: 'no input candidates found' };
+      if (!injectIgnored) {
+        const arg = expr.match(/\}\)\(([\s\S]*)\)\s*$/)[1];
+        composer += JSON.parse(arg);
+      }
+      return { ok: true };
     }
     if (expr.includes('selectAll')) {
-      return clearFails ? { ok: false, reason: 'composer vanished' } : { ok: true };
+      const fails = clearFails === 'restore' ? opened : clearFails;
+      if (fails) return { ok: false, reason: 'composer vanished' };
+      composer = '';
+      return { ok: true };
     }
     return { ok: true };
   };
@@ -1670,6 +1833,50 @@ test('openMcpPanel: a draft that did not come back does fail the action', async 
   const out = await openMcpPanel(fakeMcpRun({ draft: 'half a sentence', restoreFails: true }));
   assert.strictEqual(out.ok, false, 'losing what someone was typing is not a note');
   assert.match(out.error, /draft was not put back/);
+});
+
+test('openMcpPanel: a draft is never typed on top of a composer that would not clear', async () => {
+  // insertText inserts at the caret. With "/mcp" still sitting there the
+  // restored draft becomes "/mcphello" — a mangled draft reported as a
+  // restored one. There is nothing safe to type, so it is reported lost.
+  const out = await openMcpPanel(fakeMcpRun({ draft: 'hello', clearFails: 'restore' }));
+  assert.strictEqual(out.ok, false);
+  assert.match(out.error, /draft was not put back/);
+  assert.match(out.error, /would not clear/);
+});
+
+test('openMcpPanel: insertText answering ok is not the draft being back', async () => {
+  // The readback is the check. execCommand has already been observed to
+  // answer for an edit the editor did not make.
+  const out = await openMcpPanel(fakeMcpRun({ draft: 'hello', injectIgnored: true }));
+  assert.strictEqual(out.ok, false);
+  assert.match(out.error, /holds ""/);
+  assert.match(out.error, /instead of your draft "hello"/);
+});
+
+test('openMcpPanel: a draft that survives the round trip is not reported', async () => {
+  const out = await openMcpPanel(fakeMcpRun({ draft: 'hello' }));
+  assert.strictEqual(out.ok, true);
+  assert.strictEqual(out.note, null);
+});
+
+test('readMcpServers and reconnectMcpServer carry the note out to the phone', async () => {
+  // A note openMcpPanel produced and its caller dropped is the same as
+  // never having detected it. The panel-level test cannot see this,
+  // because it calls openMcpPanel directly.
+  const list = await readMcpServers(fakeMcpRun({ draft: '', clearFails: true }));
+  assert.strictEqual(list.ok, true);
+  assert.match(list.note, /may be left in the laptop composer/);
+
+  // Its failure exits have to carry it too: that is where the author is
+  // most likely to go looking at the laptop, and the untidy composer is
+  // part of what they will find.
+  const recon = await reconnectMcpServer(
+    fakeMcpRun({ draft: '', clearFails: true, rowClickFails: true }),
+    'nope',
+  );
+  assert.strictEqual(recon.ok, false);
+  assert.match(recon.note, /may be left in the laptop composer/);
 });
 
 test('openMcpPanel: a clean run carries no note', async () => {

@@ -315,7 +315,12 @@ function clickReconnectFor(name) {
     panel = panel.parentElement;
     hops += 1;
   }
-  if (!panel) return { ok: false, reason: 'found the title but not the actions it belongs to' };
+  // The loop also exits on the hop cap, with panel non-null and nothing
+  // proved. Re-assert containment rather than inferring it from the walk
+  // having stopped.
+  if (!panel || !panel.contains(actions)) {
+    return { ok: false, reason: 'found the title but not the actions it belongs to' };
+  }
 
   const btns = [...actions.querySelectorAll('[class*="actionButton_"]')]
     .filter((el) => (el.textContent || '').trim() === 'Reconnect');
@@ -793,10 +798,6 @@ async function openMcpPanel(run) {
 
   let mutated = false;
   let note = null;
-  // Returns null when the composer is back as it was found, or a sentence
-  // when it is not. Swallowing these meant an action could report success
-  // having lost someone's draft — the one outcome the save/restore exists
-  // to prevent.
   // Returns null when the composer is back as it was found, or a
   // sentence when it is not. Losing a draft is the outcome this exists to
   // prevent and is reported as a failure; leaving "/mcp" behind in an
@@ -812,6 +813,14 @@ async function openMcpPanel(run) {
       cleared = { ok: false, reason: err.message };
     }
     if (!draft) return cleared.ok ? null : `note: "/mcp" may be left in the laptop composer (${cleared.reason})`;
+    // Typing on top of a composer that still holds "/mcp" concatenates the
+    // two — "/mcphello" — and calls that a restored draft. With nothing
+    // cleared there is nothing safe to type, so the draft is reported lost
+    // instead of silently mangled.
+    if (!cleared.ok) {
+      return `your laptop draft was not put back (the composer would not clear: ${cleared.reason})` +
+        ' — check the laptop';
+    }
     let back;
     try {
       back = await run(injectExpr(draft));
@@ -819,6 +828,18 @@ async function openMcpPanel(run) {
       back = { ok: false, reason: err.message };
     }
     if (!back.ok) return `your laptop draft was not put back (${back.reason}) — check the laptop`;
+    // insertText reporting success is not the text having landed, and this
+    // is the one place where believing it costs someone their draft.
+    let after;
+    try {
+      after = await run(MENU_STATE_EXPR);
+    } catch (err) {
+      after = { draft: null };
+    }
+    if (after.draft !== draft) {
+      return `your laptop composer holds ${JSON.stringify(after.draft)} instead of your draft` +
+        ` ${JSON.stringify(draft)} — check the laptop`;
+    }
     return null;
   };
 
@@ -899,12 +920,13 @@ async function closeMcpPanel(run) {
 async function readMcpServers(run) {
   const opened = await openMcpPanel(run);
   if (!opened.ok) return opened;
+  const withNote = (res) => (opened.note ? { ...res, note: opened.note } : res);
   let state = opened.state;
   if (state.panel === 'detail') {
     const back = await run(clickByText('backButton_', '← Back to list'));
     if (!back.ok) {
       await closeMcpPanel(run);
-      return { ok: false, error: `could not get back to the server list: ${back.reason}` };
+      return withNote({ ok: false, error: `could not get back to the server list: ${back.reason}` });
     }
     // Wait for the list, not for rows. Waiting for rows makes "the Back
     // click did nothing" and "there are no servers" the same observation,
@@ -914,16 +936,20 @@ async function readMcpServers(run) {
     state = await waitFor(run, MCP_STATE_EXPR, (st) => st.panel === 'list');
     if (state.panel !== 'list') {
       await closeMcpPanel(run);
-      return { ok: false, error: 'clicked Back but the server list never appeared' };
+      return withNote({ ok: false, error: 'clicked Back but the server list never appeared' });
     }
   }
   await closeMcpPanel(run);
-  return { ok: true, servers: state.rows };
+  return withNote({ ok: true, servers: state.rows });
 }
 
 async function reconnectMcpServer(run, name) {
   const opened = await openMcpPanel(run);
   if (!opened.ok) return opened;
+  // Every exit below carries it. openMcpPanel's note says "/mcp" may be
+  // sitting in the laptop composer; dropping it on the way out means the
+  // author is never told, which is the same as never having detected it.
+  const withNote = (res) => (opened.note ? { ...res, note: opened.note } : res);
   let state = opened.state;
 
   if (state.panel === 'detail' && state.title !== name) {
@@ -934,7 +960,7 @@ async function reconnectMcpServer(run, name) {
     const row = await run(clickServerRow(name));
     if (!row.ok) {
       await closeMcpPanel(run);
-      return { ok: false, error: `${row.reason}${row.seen ? ` (saw: ${row.seen.join(', ')})` : ''}` };
+      return withNote({ ok: false, error: `${row.reason}${row.seen ? ` (saw: ${row.seen.join(', ')})` : ''}` });
     }
     state = await waitFor(run, MCP_STATE_EXPR, (st) => st.panel === 'detail' && st.title === name);
   }
@@ -942,7 +968,7 @@ async function reconnectMcpServer(run, name) {
   const clicked = await run(clickReconnectFor(name));
   if (!clicked.ok) {
     await closeMcpPanel(run);
-    return { ok: false, error: clicked.reason };
+    return withNote({ ok: false, error: clicked.reason });
   }
 
   // The button reads "Reconnecting…" while in flight; settled is when it
@@ -964,11 +990,11 @@ async function reconnectMcpServer(run, name) {
     // saying so is the point.
     const settled = await run(MCP_STATE_EXPR);
     await closeMcpPanel(run);
-    return {
+    return withNote({
       ok: true,
       status: 'clicked, but never saw it start — check the laptop',
       title: settled.title,
-    };
+    });
   }
 
   const ended = await waitFor(
@@ -978,11 +1004,11 @@ async function reconnectMcpServer(run, name) {
     { timeoutMs: 20000 },
   );
   await closeMcpPanel(run);
-  if (ended.busy) return { ok: false, error: 'still reconnecting after 20s' };
+  if (ended.busy) return withNote({ ok: false, error: 'still reconnecting after 20s' });
   if (ended.title !== name) {
-    return { ok: false, error: 'the detail view moved away while reconnecting' };
+    return withNote({ ok: false, error: 'the detail view moved away while reconnecting' });
   }
-  return { ok: true, status: ended.status ? `reconnected — ${ended.status}` : 'reconnected' };
+  return withNote({ ok: true, status: ended.status ? `reconnected — ${ended.status}` : 'reconnected' });
 }
 
 // Serialise everything that touches one session's composer or panel.
@@ -1017,7 +1043,22 @@ class SessionQueue {
 
   // Marks the session busy for the duration, so submits can be refused
   // rather than silently delayed past their deadline.
+  //
+  // Long actions do not queue behind each other; the second is refused.
+  // A Set holds one entry per session however many holders there are, so
+  // two overlapping long actions share it and the first to finish clears
+  // it while the second is still driving the composer — isBusy then says
+  // idle and a submit types into the middle of an MCP flow. The second
+  // action would also run out past the deadline of the HTTP request that
+  // asked for it, doing work to nobody. Refusing at the door is both the
+  // honest answer and the simpler invariant: busy means exactly one.
   runLong(sessionId, fn) {
+    if (this.busy.has(sessionId)) {
+      return Promise.resolve({
+        ok: false,
+        error: 'already driving Claude Code on the laptop — try again in a moment',
+      });
+    }
     // Marked synchronously, before the chain. Setting it inside the
     // queued function defers it by a microtask, and a submit arriving in
     // that window sees an idle session and queues behind the long action
@@ -1351,6 +1392,7 @@ class Daemon {
     // addresses by.
     const until = Date.now() + 15000;
     let fresh = null;
+    let candidate = null;
     while (Date.now() < until && !fresh) {
       await new Promise((r) => setTimeout(r, 400));
       let now;
@@ -1371,7 +1413,19 @@ class Daemon {
           error: `${added.length} new conversations appeared at once — not typing into any of them`,
         };
       }
-      fresh = added[0] || null;
+      // A candidate has to survive one more poll before anything is typed
+      // into it. Refusing only when two ids share a single snapshot misses
+      // the ordinary shape of the race: an unrelated webview — VS Code
+      // restoring one, or the author opening one on the laptop — mounts a
+      // poll ahead of the intended one, is the only candidate at that
+      // instant, and takes the prompt. Confirming costs one poll interval
+      // and turns that into the refusal above.
+      if (!added.length) {
+        candidate = null;
+        continue;
+      }
+      if (candidate === added[0]) fresh = candidate;
+      else candidate = added[0];
     }
     if (!fresh) return { ok: false, error: 'clicked New session but no new session appeared' };
     if (!text) return { ok: true, sessionId: fresh };
@@ -1668,6 +1722,8 @@ module.exports = {
   arraysEqual,
   stripTags,
   injectExpr,
+  readMcpServers,
+  reconnectMcpServer,
   dispatchEnter,
   SessionWatcher,
   Daemon,
