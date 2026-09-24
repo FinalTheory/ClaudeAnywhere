@@ -686,7 +686,15 @@ const CLEAR_COMPOSER_EXPR = `
 // expression in that session's content frame.
 async function openMcpPanel(run) {
   let state = await run(MCP_STATE_EXPR);
-  if (state.panel !== 'none') return { ok: true, state };
+  if (state.panel !== 'none') {
+    // Normally none: the panel is opened and closed within one action, and
+    // measured against a live session it is gone again on the next entry.
+    // Finding it already there means a previous action did not close it,
+    // which leaves the author's screen where the phone put it — worth a
+    // line, since nothing else would ever say so.
+    console.error(`[mcp] panel was already open on entry (${state.panel}) — a previous action did not close it`);
+    return { ok: true, state };
+  }
 
   // Type "/mcp" rather than opening the menu with its button. The menu
   // filters on what is in the composer, and opening it cold lists every
