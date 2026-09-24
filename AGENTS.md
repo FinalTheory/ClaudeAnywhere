@@ -179,6 +179,22 @@ propagates it. That has happened — `if mtype == "action_result":` survived
 as `if False:` across two commands, and what caught it was a `git diff`
 looking for leftovers, not the restore itself.
 
+**A test must fail, not hang, when the defect is present.** Twice now a
+test has been written so the reintroduced defect leaves it awaiting
+something that never arrives — a queued call behind a holder that never
+releases, a promise the socket death no longer settles. Under the test
+runner that reads as a stuck suite, and it takes the rest of the file
+down with it, so a mutation run reports nothing rather than reporting a
+catch. Where the defect's shape is "never settles", race the await
+against a short timer and assert on which one won.
+
+The suite takes about sixteen seconds, and two tests account for twelve
+of them: the reconnect that is never observed to start, and the MCP panel
+that never opens. Both are waiting out a real timeout in the code under
+test. Neither is slow by accident, and neither can be shortened without
+either making the timeout injectable — test-only machinery in production
+code — or dropping the case.
+
 **A DOM expression must be proved to parse, not just to be a valid
 string.** These are built inside template literals and evaluated in a
 browser, so a backslash is consumed twice: `\/` in the source reaches the
