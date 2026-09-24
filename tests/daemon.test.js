@@ -38,6 +38,9 @@ const {
   MAX_RESYNC_TURNS,
   CMD_MODIFIER,
   readMcpServers,
+  DEPLOY_EXCLUDES,
+  isExcludedFromDeploy,
+  numberEnv,
   reconnectMcpServer,
 } = require('../client/daemon.js');
 
@@ -2008,4 +2011,60 @@ test('openMcpPanel: a clean run carries no note', async () => {
   const out = await openMcpPanel(fakeMcpRun({ draft: 'hello' }));
   assert.strictEqual(out.ok, true);
   assert.strictEqual(out.note, null);
+});
+
+// --- the deploy watcher --------------------------------------------------
+
+test('deploy: server/data is never pushed', () => {
+  // This is the whole live conversation history on the VPS. A server run
+  // locally writes data/<id>.json named by this same laptop's webview
+  // ids, so the local filenames are exactly the production ones — and
+  // the rsync that overwrites them is the one that triggers the restart
+  // that loads them. --delete was never the protection: adding is enough
+  // to destroy what was there. Two comments claimed this was excluded
+  // while the command excluded only __pycache__.
+  assert.ok(DEPLOY_EXCLUDES.includes('data'));
+  assert.ok(isExcludedFromDeploy('data/s.json'));
+  assert.ok(isExcludedFromDeploy('data'));
+});
+
+test('deploy: the VPS .env is never overwritten by a local one', () => {
+  // It holds the VPS's own AUTH_TOKEN; pushing a local one changes the
+  // password out from under the phone. rsync sends dotfiles by default,
+  // so this has to be excluded by name.
+  assert.ok(DEPLOY_EXCLUDES.includes('.env'));
+  assert.ok(isExcludedFromDeploy('.env'));
+});
+
+test('deploy: ordinary source files are still pushed', () => {
+  // The exclusion must not be so broad it stops deploying.
+  for (const name of ['server.py', 'static/app.js', 'static/style.css', 'static/index.html']) {
+    assert.strictEqual(isExcludedFromDeploy(name), false, name);
+  }
+});
+
+test('deploy: build noise does not schedule a push', () => {
+  assert.ok(isExcludedFromDeploy('__pycache__/server.cpython-313.pyc'));
+  assert.ok(isExcludedFromDeploy('server.pyc'));
+});
+
+test('numberEnv: a value with a unit does not become a 1ms timer', () => {
+  // Number("1500ms") is NaN and NaN reaches setTimeout as 1 — a poll spin
+  // that hammers CDP and grows daemon.log without limit, saying nothing.
+  const saved = process.env.TEST_KNOB;
+  try {
+    process.env.TEST_KNOB = '1500ms';
+    assert.strictEqual(numberEnv('TEST_KNOB', 1500), 1500);
+    process.env.TEST_KNOB = '-5';
+    assert.strictEqual(numberEnv('TEST_KNOB', 1500), 1500);
+    process.env.TEST_KNOB = '0';
+    assert.strictEqual(numberEnv('TEST_KNOB', 1500), 1500);
+    process.env.TEST_KNOB = '';
+    assert.strictEqual(numberEnv('TEST_KNOB', 1500), 1500);
+    process.env.TEST_KNOB = '3000';
+    assert.strictEqual(numberEnv('TEST_KNOB', 1500), 3000, 'a good value is still honoured');
+  } finally {
+    if (saved === undefined) delete process.env.TEST_KNOB;
+    else process.env.TEST_KNOB = saved;
+  }
 });

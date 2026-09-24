@@ -37,11 +37,41 @@ load_dotenv()
 START_TIME = time.time()
 
 AUTH_TOKEN = os.environ["AUTH_TOKEN"]
+# Present is not the same as set. An empty value makes every comparison
+# below succeed — `hmac.compare_digest("", "")` is True — so an empty
+# password logs in and an empty daemon token authenticates, on the side
+# of this that faces the internet. A short one is not much better and the
+# check costs nothing. Fails at boot, where it is visible, rather than at
+# the first request, where it is not.
+if len(AUTH_TOKEN) < 16:
+    raise SystemExit(
+        "AUTH_TOKEN must be at least 16 characters; an empty or short one "
+        "authenticates anyone. Generate one with: openssl rand -hex 32"
+    )
 HOST = os.environ.get("HOST", "127.0.0.1")
 PORT = int(os.environ.get("PORT", "8764"))
 DATA_DIR = Path(__file__).parent / "data"
-INITIAL_LOAD_BYTES = 2048  # tail context (in whole turns) a phone gets on open
-MAX_SESSION_BYTES = 1_000_000  # per-session cap, oldest whole turns dropped first
+def _int_env(name: str, fallback: int) -> int:
+    raw = os.environ.get(name, "")
+    if not raw:
+        return fallback
+    try:
+        n = int(raw)
+    except ValueError:
+        print(f"[config] {name}={raw!r} is not a number — using {fallback}", flush=True)
+        return fallback
+    if n <= 0:
+        print(f"[config] {name}={n} must be positive — using {fallback}", flush=True)
+        return fallback
+    return n
+
+
+INITIAL_LOAD_BYTES = _int_env("INITIAL_LOAD_BYTES", 2048)
+# The per-session cap, oldest whole turns dropped first. Three settled
+# review rulings (F1.2, F5.1, F12.5) decline work on the grounds that it
+# is unreachable below this number, so it is not a free knob: raising it
+# widens what those rulings left uncovered.
+MAX_SESSION_BYTES = _int_env("MAX_SESSION_BYTES", 1_000_000)
 COOKIE_NAME = "evi_remote_auth"
 COOKIE_MAX_AGE = 30 * 24 * 3600  # 30 days
 
@@ -111,18 +141,49 @@ class SessionState:
             return
         try:
             data = json.loads(p.read_text())
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as err:
+            # Say so. Silently returning leaves an empty history that the
+            # next append writes over, which on the phone is
+            # indistinguishable from a conversation that never existed —
+            # and the file is kept, so it can still be looked at.
+            print(f"[store] {p.name} did not load ({err}); starting this session empty",
+                  flush=True)
+            try:
+                p.rename(p.with_suffix(".json.corrupt"))
+            except OSError:
+                pass
             return
         self.turns = data.get("turns", [])
         self.running = data.get("running")
         self.last_seen = data.get("last_seen", time.time())
 
     def save(self):
-        self.path().write_text(json.dumps({
+        # Written beside the target and renamed over it. write_text
+        # truncates first, so anything that interrupts it — watchfiles
+        # SIGTERMing on a deploy, a full disk — leaves a file that parses
+        # as nothing, and this rewrites up to MAX_SESSION_BYTES every
+        # 1.5s while a reply streams, so the window is not rare.
+        # os.replace is atomic within a filesystem: readers see the old
+        # file or the new one.
+        target = self.path()
+        tmp = target.with_suffix(".json.tmp")
+        payload = json.dumps({
             "turns": self.turns,
             "running": self.running,
             "last_seen": self.last_seen,
-        }))
+        })
+        try:
+            tmp.write_text(payload)
+            os.replace(tmp, target)
+        except OSError as err:
+            # A full disk is the reachable case, and losing history is
+            # survivable here — failing the frame loop over it is not,
+            # because that path does not report itself.
+            print(f"[store] could not save {target.name}: {err}", flush=True)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _cap(self):
         total = sum(len(t) for t in self.turns)
@@ -335,120 +396,130 @@ async def ws_client_handler(request: web.Request) -> web.WebSocketResponse:
     client_ws = ws
     client_authed = False
 
-    async for msg in ws:
-        if msg.type != WSMsgType.TEXT:
-            continue
-        try:
-            data = json.loads(msg.data)
-        except json.JSONDecodeError:
-            continue
+    # The frame loop must not be able to skip the disconnect below. Any
+    # exception in here — a save that hits a full disk, a frame missing a
+    # field — otherwise leaves client_ws pointing at a closed socket:
+    # /healthz reports the laptop connected, /api/sessions raises instead
+    # of returning the 503 sentence, no phone is told anything, and the
+    # next submit kills the asking socket. The phone handler has had this
+    # shape all along.
+    try:
+        async for msg in ws:
+            if msg.type != WSMsgType.TEXT:
+                continue
+            try:
+                data = json.loads(msg.data)
+            except json.JSONDecodeError:
+                continue
 
-        mtype = data.get("type")
+            mtype = data.get("type")
 
-        if mtype == "hello":
-            if hmac.compare_digest(data.get("token", ""), AUTH_TOKEN):
-                client_authed = True
-                await ws.send_json({"type": "auth_ok"})
-                # The daemon is a fresh process (or fresh connection) with no
-                # memory of what it was watching before — re-issue subscribe
-                # for every session a phone is still looking at, so viewers
-                # don't go silently stale after a daemon restart/reconnect.
-                for st in sessions.values():
-                    if st.phone_sockets:
-                        await ws.send_json({"type": "subscribe", "sessionId": st.session_id})
-                await broadcast_all({"type": "laptop", "connected": True})
-            else:
-                await ws.send_json({"type": "auth_failed"})
-                await ws.close()
-            continue
-
-        if not client_authed:
-            continue
-
-        if mtype == "ping":
-            # The daemon's own liveness probe. A changed wifi route can
-            # black-hole an established connection with no close on either
-            # side; protocol-level ping/pong is handled below the daemon's
-            # WebSocket API and never reaches its code, so it needs an
-            # answer it can actually observe.
-            await ws.send_json({"type": "pong"})
-            continue
-
-        if mtype == "action_result":
-            # Reply to a phone-initiated action, routed back by reqId the
-            # same way sessions_result is.
-            fut = pending_requests.pop(data.get("reqId"), None)
-            if fut and not fut.done():
-                fut.set_result(data)
-            continue
-
-        if mtype == "sessions_result":
-            fut = pending_requests.pop(data.get("reqId"), None)
-            if fut and not fut.done():
-                # The whole payload, not just the list: `cdp` distinguishes
-                # "VS Code did not answer" from "VS Code is open with no
-                # Claude tabs", which are the same empty list.
-                fut.set_result(data)
-            continue
-
-        if mtype == "state":
-            st = get_session(data["sessionId"])
-            st.apply_state(data["running"])
-            await broadcast(st, {"type": "state", "running": data["running"]})
-            continue
-
-        if mtype == "append":
-            st = get_session(data["sessionId"])
-            st.apply_append(data["turns"])
-            await broadcast(st, {"type": "append", "turns": data["turns"]})
-            continue
-
-        if mtype == "resync":
-            st = get_session(data["sessionId"])
-            st.apply_resync(data["turns"])  # full fidelity — this is the pagination source of truth
-            # Never forward the full stored history to phones: a resync used
-            # to carry the daemon's ENTIRE current snapshot (hundreds of KB
-            # to multiple MB for a long session — confirmed empirically at
-            # 750KB), and a resync fires on every subscribe by daemon design
-            # (needed to correctly reconcile after a daemon restart).
-            # Forwarding it verbatim silently defeated the "load ~2KB,
-            # lazy-load older history on scroll" design the instant a phone
-            # (re)opened a session. Phones get the same tail window `initial`
-            # would give — see tail_window().
-            window_turns, start_index = tail_window(st.turns, INITIAL_LOAD_BYTES)
-            await broadcast(st, {"type": "resync", "turns": window_turns, "startIndex": start_index})
-            continue
-
-        if mtype == "submit_ack":
-            st = sessions.get(data.get("sessionId", ""))
-            if st:
-                target = None
-                while st.awaiting_ack:
-                    candidate = st.awaiting_ack.popleft()
-                    if not candidate.closed:
-                        target = candidate
-                        break
-                if target is not None:
-                    try:
-                        await target.send_json(data)
-                    except Exception:
-                        st.phone_sockets.discard(target)
+            if mtype == "hello":
+                if hmac.compare_digest(data.get("token", ""), AUTH_TOKEN):
+                    client_authed = True
+                    await ws.send_json({"type": "auth_ok"})
+                    # The daemon is a fresh process (or fresh connection) with no
+                    # memory of what it was watching before — re-issue subscribe
+                    # for every session a phone is still looking at, so viewers
+                    # don't go silently stale after a daemon restart/reconnect.
+                    for st in sessions.values():
+                        if st.phone_sockets:
+                            await ws.send_json({"type": "subscribe", "sessionId": st.session_id})
+                    await broadcast_all({"type": "laptop", "connected": True})
                 else:
-                    # The tab that asked is gone. Everyone else is better
-                    # off hearing it than nobody being told at all.
+                    await ws.send_json({"type": "auth_failed"})
+                    await ws.close()
+                continue
+
+            if not client_authed:
+                continue
+
+            if mtype == "ping":
+                # The daemon's own liveness probe. A changed wifi route can
+                # black-hole an established connection with no close on either
+                # side; protocol-level ping/pong is handled below the daemon's
+                # WebSocket API and never reaches its code, so it needs an
+                # answer it can actually observe.
+                await ws.send_json({"type": "pong"})
+                continue
+
+            if mtype == "action_result":
+                # Reply to a phone-initiated action, routed back by reqId the
+                # same way sessions_result is.
+                fut = pending_requests.pop(data.get("reqId"), None)
+                if fut and not fut.done():
+                    fut.set_result(data)
+                continue
+
+            if mtype == "sessions_result":
+                fut = pending_requests.pop(data.get("reqId"), None)
+                if fut and not fut.done():
+                    # The whole payload, not just the list: `cdp` distinguishes
+                    # "VS Code did not answer" from "VS Code is open with no
+                    # Claude tabs", which are the same empty list.
+                    fut.set_result(data)
+                continue
+
+            if mtype == "state":
+                st = get_session(data["sessionId"])
+                st.apply_state(data["running"])
+                await broadcast(st, {"type": "state", "running": data["running"]})
+                continue
+
+            if mtype == "append":
+                st = get_session(data["sessionId"])
+                st.apply_append(data["turns"])
+                await broadcast(st, {"type": "append", "turns": data["turns"]})
+                continue
+
+            if mtype == "resync":
+                st = get_session(data["sessionId"])
+                st.apply_resync(data["turns"])  # full fidelity — this is the pagination source of truth
+                # Never forward the full stored history to phones: a resync used
+                # to carry the daemon's ENTIRE current snapshot (hundreds of KB
+                # to multiple MB for a long session — confirmed empirically at
+                # 750KB), and a resync fires on every subscribe by daemon design
+                # (needed to correctly reconcile after a daemon restart).
+                # Forwarding it verbatim silently defeated the "load ~2KB,
+                # lazy-load older history on scroll" design the instant a phone
+                # (re)opened a session. Phones get the same tail window `initial`
+                # would give — see tail_window().
+                window_turns, start_index = tail_window(st.turns, INITIAL_LOAD_BYTES)
+                await broadcast(st, {"type": "resync", "turns": window_turns, "startIndex": start_index})
+                continue
+
+            if mtype == "submit_ack":
+                st = sessions.get(data.get("sessionId", ""))
+                if st:
+                    target = None
+                    while st.awaiting_ack:
+                        candidate = st.awaiting_ack.popleft()
+                        if not candidate.closed:
+                            target = candidate
+                            break
+                    if target is not None:
+                        try:
+                            await target.send_json(data)
+                        except Exception:
+                            st.phone_sockets.discard(target)
+                    else:
+                        # The tab that asked is gone. Everyone else is better
+                        # off hearing it than nobody being told at all.
+                        await broadcast(st, data)
+                continue
+
+            if mtype in ("error", "recovered"):
+                st = sessions.get(data.get("sessionId", ""))
+                if st:
                     await broadcast(st, data)
-            continue
-
-        if mtype in ("error", "recovered"):
-            st = sessions.get(data.get("sessionId", ""))
-            if st:
-                await broadcast(st, data)
-            continue
-
-    if client_ws is ws:
-        client_ws = None
-        client_authed = False
-        await broadcast_all({"type": "laptop", "connected": False})
+                continue
+    except Exception as err:
+        print(f"[client] frame loop stopped: {err!r}", flush=True)
+    finally:
+        if client_ws is ws:
+            client_ws = None
+            client_authed = False
+            await broadcast_all({"type": "laptop", "connected": False})
     return ws
 
 

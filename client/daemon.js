@@ -88,14 +88,32 @@ function installFileLogging() {
 // are reachable without a live Chrome.
 const cdp = require('../cdp-client');
 
-const CDP_PORT = Number(process.env.CDP_PORT || 9222);
+// Validated rather than coerced. `Number("1500ms")` is NaN, and NaN
+// reaches setTimeout as 1 — a 1ms poll spin that hammers CDP and appends
+// to daemon.log without limit, with nothing anywhere saying why. A typo
+// in a unit is the likeliest way anyone sets one of these wrong.
+function numberEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    console.error(`${name}=${JSON.stringify(raw)} is not a positive number — using ${fallback}`);
+    return fallback;
+  }
+  return n;
+}
+
+const CDP_PORT = numberEnv('CDP_PORT', 9222);
 const VPS_WS_URL = process.env.VPS_WS_URL;
 const AUTH_TOKEN = process.env.AUTH_TOKEN;
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 1500);
+const POLL_INTERVAL_MS = numberEnv('POLL_INTERVAL_MS', 1500);
 
 const DEPLOY_TARGET = process.env.DEPLOY_TARGET;
 const DEPLOY_WATCH_DIR = path.resolve(__dirname, process.env.DEPLOY_WATCH_DIR || '../server');
 const DEPLOY_DEBOUNCE_MS = 400; // never needed tuning in practice
+// Checked after every push, when set. Without it a bad save takes the
+// live server down and the traceback is somewhere nobody is looking.
+const HEALTH_URL = process.env.HEALTH_URL;
 
 function requireEnv() {
   if (!VPS_WS_URL || !AUTH_TOKEN) {
@@ -1681,18 +1699,49 @@ function watchConnection(daemon) {
 // run. No-op if DEPLOY_TARGET isn't set.
 
 let deployTimer = null;
+let deployInFlight = false;
+let deployAgain = false;
+
+// Never pushed, whatever else changes here.
+//
+// `data/` is the live conversation history on the VPS. Running the server
+// locally — to try something, or from a test — writes `data/<id>.json`
+// named by this same laptop's webview ids, so the local filenames are
+// exactly the production ones. Without this the next save rsyncs those
+// over the real history and the same rsync triggers the restart that
+// loads them. --delete was never the protection: adding is enough to
+// destroy the file that was there.
+//
+// `.env` holds the VPS's own AUTH_TOKEN. Pushing a local one changes the
+// password out from under the phone.
+const DEPLOY_EXCLUDES = ['__pycache__', 'data', '.env', '*.pyc', '.DS_Store'];
+
+// The same exclusions the push uses. A server running locally rewrites
+// data/*.json every poll, and without this each write schedules a deploy
+// — the restart storm --ignore-paths=data was added to stop, on the side
+// it was never applied to.
+function isExcludedFromDeploy(name) {
+  if (!name) return false;
+  const parts = String(name).split(/[\\/]/);
+  return DEPLOY_EXCLUDES.some((e) => parts.includes(e) || (e.startsWith('*') && parts.some((q) => q.endsWith(e.slice(1)))));
+}
 
 function deploySync() {
-  // No --delete: this only ever adds/updates files on the VPS from what's
-  // here locally, never removes anything there (so server.py's own
-  // ./data — which doesn't exist in this source tree — is untouched
-  // regardless of exclude flags). Hidden files (.env included) sync too —
-  // rsync includes dotfiles by default for a directory's contents, nothing
-  // extra needed for that. Still skip __pycache__: pure local build noise,
-  // never wanted on the VPS.
-  const cmd = `rsync -avz --exclude=__pycache__ "${DEPLOY_WATCH_DIR}/" "${DEPLOY_TARGET}/"`;
+  // Serialised. Two saves inside one rsync let the second finish first and
+  // leave the VPS holding the older edit, with both runs logging "done".
+  if (deployInFlight) {
+    deployAgain = true;
+    return;
+  }
+  deployInFlight = true;
+  // No --delete: this only ever adds or updates files on the VPS, never
+  // removes anything there. Hidden files sync by default for a
+  // directory's contents, which is why .env has to be excluded by name.
+  const excludes = DEPLOY_EXCLUDES.map((e) => `--exclude=${e}`).join(' ');
+  const cmd = `rsync -avz ${excludes} "${DEPLOY_WATCH_DIR}/" "${DEPLOY_TARGET}/"`;
   console.error(`[deploy] ${cmd}`);
   exec(cmd, (err, stdout, stderr) => {
+    deployInFlight = false;
     if (err) {
       console.error(`[deploy] rsync failed: ${err.message}`);
       return;
@@ -1700,7 +1749,33 @@ function deploySync() {
     if (stdout) process.stdout.write(stdout);
     if (stderr) process.stderr.write(stderr);
     console.error('[deploy] done');
+    if (deployAgain) {
+      deployAgain = false;
+      deploySync();
+    } else {
+      verifyDeploy();
+    }
   });
+}
+
+// A bad save takes the live server down and the traceback is on the VPS,
+// where nobody is looking. /healthz exists for exactly this and nothing
+// ever called it. One request, after the restart has had a moment.
+function verifyDeploy() {
+  if (!HEALTH_URL) return;
+  setTimeout(async () => {
+    try {
+      const res = await fetch(HEALTH_URL, { signal: AbortSignal.timeout(5000) });
+      if (!res.ok) {
+        console.error(`[deploy] the server answered HTTP ${res.status} after this push`);
+        return;
+      }
+      const body = await res.json();
+      console.error(`[deploy] server healthy (uptime ${Math.round(body.uptime_seconds || 0)}s)`);
+    } catch (err) {
+      console.error(`[deploy] THE SERVER IS NOT ANSWERING after this push: ${err.message}`);
+    }
+  }, 2000);
 }
 
 function startDeployWatch() {
@@ -1711,7 +1786,8 @@ function startDeployWatch() {
   // exits the process. Deploying is an optional convenience; the VPS
   // bridge is the point. Losing the first must not cost the second.
   try {
-    const watcher = fs.watch(DEPLOY_WATCH_DIR, { recursive: true }, () => {
+    const watcher = fs.watch(DEPLOY_WATCH_DIR, { recursive: true }, (evt, name) => {
+      if (isExcludedFromDeploy(name)) return;
       clearTimeout(deployTimer);
       deployTimer = setTimeout(deploySync, DEPLOY_DEBOUNCE_MS);
     });
@@ -1764,6 +1840,9 @@ module.exports = {
   diffTurns,
   arraysEqual,
   stripTags,
+  numberEnv,
+  DEPLOY_EXCLUDES,
+  isExcludedFromDeploy,
   injectExpr,
   readMcpServers,
   reconnectMcpServer,

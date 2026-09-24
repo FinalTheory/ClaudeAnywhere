@@ -38,7 +38,7 @@ standard to apply:
 
 ## Where the real risk is
 
-Three places have earned scrutiny, because each has produced a visible defect:
+Four places have earned scrutiny, because each has produced a visible defect:
 
 1. **`SessionState.apply_resync`** (`server/server.py`) — reconciles the
    daemon's capped tail against stored history by content overlap, with no

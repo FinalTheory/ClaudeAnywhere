@@ -16,7 +16,7 @@ from pathlib import Path
 
 # server.py reads AUTH_TOKEN at import and exits without it. Set it before
 # the import, not in setUp.
-os.environ.setdefault("AUTH_TOKEN", "test-token")
+os.environ.setdefault("AUTH_TOKEN", "test-token-long-enough-for-the-boot-check")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
 
 import server  # noqa: E402
@@ -24,7 +24,7 @@ import server  # noqa: E402
 from aiohttp.test_utils import AioHTTPTestCase  # noqa: E402
 from aiohttp import WSMsgType  # noqa: E402
 
-TOKEN = "test-token"
+TOKEN = "test-token-long-enough-for-the-boot-check"
 AUTH_HEADER = {"Authorization": f"Bearer {TOKEN}"}
 
 
@@ -159,6 +159,67 @@ class SessionStateTests(IsolatedState):
         st = self.make()
         st.apply_resync(["a", "b"])
         self.assertEqual(st.turns, ["a", "b"])
+
+    def test_an_empty_or_short_auth_token_is_refused_at_boot(self):
+        """`hmac.compare_digest("", "")` is True, so an empty AUTH_TOKEN
+        makes every check below it succeed: an empty password logs in and
+        an empty daemon token authenticates, on the side of this that
+        faces the internet. The daemon already rejected an empty one."""
+        import subprocess
+
+        for bad in ("", "short"):
+            env = dict(os.environ, AUTH_TOKEN=bad)
+            proc = subprocess.run(
+                [sys.executable, "-c", "import server"],
+                cwd=str(Path(__file__).resolve().parent.parent / "server"),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertNotEqual(proc.returncode, 0, f"AUTH_TOKEN={bad!r} booted")
+            self.assertIn("at least 16", proc.stdout + proc.stderr)
+
+    def test_a_torn_file_is_reported_and_kept_rather_than_silently_empty(self):
+        """write_text truncates before it writes, and this rewrites up to
+        MAX_SESSION_BYTES every 1.5s while a reply streams, so an
+        interrupted save is not rare. Loading it as [] and appending over
+        it loses the whole conversation, and on the phone that is
+        indistinguishable from a session that never existed."""
+        st = self.make(["<div>a</div>"])
+        st.save()
+        st.path().write_text('{"turns": ["<div>a</div>"')  # truncated mid-write
+        fresh = server.SessionState(st.session_id)
+        fresh.load()
+        self.assertEqual(fresh.turns, [], "it cannot be read, so the session starts empty")
+        self.assertFalse(st.path().exists(), "but the unreadable file is not overwritten")
+        self.assertTrue(
+            st.path().with_suffix(".json.corrupt").exists(),
+            "it is kept under a name that says what it is",
+        )
+
+    def test_save_is_atomic_and_leaves_no_temp_behind(self):
+        st = self.make(["<div>a</div>"])
+        st.save()
+        fresh = server.SessionState(st.session_id)
+        fresh.load()
+        self.assertEqual(fresh.turns, ["<div>a</div>"])
+        self.assertFalse(
+            st.path().with_suffix(".json.tmp").exists(), "the scratch file is renamed, not left"
+        )
+
+    def test_a_full_disk_does_not_take_the_frame_loop_with_it(self):
+        st = self.make(["<div>a</div>"])
+        original = server.Path.write_text
+
+        def boom(self, *a, **kw):
+            raise OSError("no space left on device")
+
+        server.Path.write_text = boom
+        try:
+            st.save()  # must not raise
+        finally:
+            server.Path.write_text = original
 
     def test_resync_uses_the_latest_overlap_when_a_turn_repeats(self):
         st = self.make(["dup", "x", "dup", "y"])
@@ -836,6 +897,42 @@ class ActionRouteTests(AioHTTPTestCase, IsolatedState):
             await asyncio.wait_for(a.receive_json(), timeout=0.3)
         await a.close()
         await b.close()
+        await daemon.close()
+
+    async def test_a_frame_loop_exception_still_reports_the_laptop_gone(self):
+        """Without the finally, any exception in the loop leaves client_ws
+        pointing at a closed socket: /healthz says connected, /api/sessions
+        raises instead of answering 503, and no phone is told anything."""
+        daemon = await self.client.ws_connect("/ws/client")
+        await daemon.send_json({"type": "hello", "token": TOKEN})
+        await asyncio.wait_for(daemon.receive_json(), timeout=5)
+
+        phone = await self.client.ws_connect("/ws/phone/s1", headers=AUTH_HEADER)
+        await asyncio.wait_for(phone.receive_json(), timeout=5)  # initial
+
+        # A frame that makes the loop raise: apply_append on a session
+        # whose save() blows up is the reachable version (full disk).
+        st = server.sessions["s1"]
+        original = type(st).save
+
+        def boom(self):
+            raise OSError("no space left on device")
+
+        type(st).save = boom
+        self.addCleanup(lambda: setattr(type(st), "save", original))
+        await daemon.send_json({"type": "append", "sessionId": "s1", "turns": ["<div>x</div>"]})
+
+        while True:
+            frame = await asyncio.wait_for(phone.receive_json(), timeout=5)
+            if frame.get("type") == "laptop":
+                break
+        self.assertFalse(frame["connected"], "the phone is told, however the loop ended")
+        self.assertIsNone(server.client_ws, "and the server stops claiming a laptop")
+
+        resp = await self.client.get("/api/sessions", headers=AUTH_HEADER)
+        self.assertEqual(resp.status, 503, "not a 500")
+        self.assertTrue((await resp.json())["error"])
+        await phone.close()
         await daemon.close()
 
     async def test_the_daemons_error_and_recovery_frames_reach_the_phone(self):

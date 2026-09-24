@@ -75,7 +75,13 @@ client -> VPS:
                                           # content-overlap, see apply_resync
   {type:"submit_ack", sessionId, ok, error?}
   {type:"action_result", reqId, ok, error?, ...}   # reply to a phone action
-  {type:"error", sessionId, message}
+  {type:"error", sessionId, message}     # once per outage, not per poll
+  {type:"recovered", sessionId}          # its counterpart: the attach came
+                                          # back. Without it the outage
+                                          # notice is the last word, since
+                                          # an unchanged session sends
+                                          # nothing else afterwards
+  {type:"pong"}
 
 VPS -> client:
   {type:"auth_ok"} / {type:"auth_failed"}
@@ -84,9 +90,16 @@ VPS -> client:
   {type:"unsubscribe", sessionId}        # stop polling it
   {type:"submit", sessionId, text}
   {type:"new_session", reqId, text}         # click New session, then type
-  {type:"list_mcp", reqId}                  # open the MCP panel and read it
-  {type:"reconnect_mcp", reqId, serverName}
+  {type:"list_mcp", reqId, sessionId?}      # open the MCP panel and read it
+  {type:"reconnect_mcp", reqId, serverName, sessionId?}
+  {type:"ping"}
 ```
+
+`sessionId` on the two MCP frames is optional and is the phone answering a
+refusal. The daemon picks the conversation in front when it can tell; when
+it cannot — a split editor, or no Claude tab on screen, which is the
+ordinary state when nobody is at the laptop — it refuses rather than
+guessing and returns the candidates, and the phone names one.
 
 **Phone <-> VPS** (`/ws/phone/<session_id>`, open only while that session's
 detail view is on screen):
@@ -99,10 +112,24 @@ VPS -> phone:
   {type:"resync", turns, startIndex}     # same tail-window cap as initial —
                                           # reset your pagination cursor to
                                           # startIndex, don't just append
-  {type:"submit_ack", ok, error?}
+  {type:"submit_ack", ok, error?}        # to the socket that submitted,
+                                          # in order — broadcast, a second
+                                          # tab disowns its own message
+  {type:"error", message}                # forwarded from the daemon
+  {type:"recovered"}                     # and its counterpart
+  {type:"laptop", connected}             # the VPS lost or regained the
+                                          # daemon. The phone's own ping
+                                          # only proves the VPS is up
+  {type:"pong"}
 
 phone -> VPS:
   {type:"submit", text}
+  {type:"ping"}                          # iOS suspends a backgrounded tab
+                                          # and the socket comes back OPEN
+                                          # but dead; protocol-level pings
+                                          # are answered below the
+                                          # WebSocket API, where page code
+                                          # cannot see them
 ```
 
 The last three drive Claude Code's own UI by clicking real controls,
@@ -196,13 +223,15 @@ value as `AUTH_TOKEN`), pick a session.
   `tail_window()`) for the tail context a phone gets immediately on opening
   a session; scrolling up pages further back via
   `/api/session/<id>/history?before_index=&limit_bytes=`.
-- `MAX_SESSION_BYTES` (server env, default 5MB) — per-session cap on
+- `MAX_SESSION_BYTES` (server env, default 1MB) — per-session cap on
   retained turns; oldest *whole* turns dropped once the combined size
   exceeds this (never a partial turn — that would reintroduce the malformed-
   HTML problem this design exists to avoid). This is also the real ceiling
   on "scroll all the way to the top" — history older than this (or older
   than whenever the daemon started watching, whichever is more recent) is
-  gone, not just unpaginated.
+  gone, not just unpaginated. Three review rulings (F1.2, F5.1, F12.5)
+  decline work on the grounds that the defect is unreachable below this
+  number, so raising it widens what they left uncovered.
 - No HTML sanitization, no CSS extraction from the Claude Code webview — by
   design, this is a single-user personal tool (the CSS actually is Claude
   Code's own, copied from the installed extension — see
@@ -236,10 +265,16 @@ value as `AUTH_TOKEN`), pick a session.
 
 ## What's still untested end-to-end
 
-Written in one pass without a live VPS or a real target to point the daemon
-at. `node --check` and `python3 -m py_compile` pass; the protocol is
-reasoned through but not exercised in practice. Spend a real debugging pass
-on: cookie/WebSocket-handshake interplay across the reverse proxy, the
-pagination offset math in `app.js`, and the one-shot-attach path in
-`daemon.js`'s `submit` handler for a session that isn't currently subscribed
-(never run).
+The suites cover the protocol, the daemon's pure logic and the phone's
+state machine offline; what none of them touch is the real world. Both
+stub CDP and the network, so nothing here has met a live VS Code, a real
+reverse proxy, or an iOS Safari. Sixteen review rounds found no defect
+involving time, size or accumulation, which most likely means the method
+cannot see that class rather than that it is absent — no test runs longer
+than sixteen seconds or against more than a handful of turns.
+
+Worth a real session with the phone in hand: cookie and WebSocket
+handshake interplay across the reverse proxy; behaviour over hours rather
+than minutes (log growth, memory, the 30-day cookie actually expiring);
+and the one-shot-attach path in `daemon.js`'s `submit` handler for a
+session that is not currently subscribed.
