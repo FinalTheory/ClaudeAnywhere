@@ -165,8 +165,13 @@ When you add a test, prove it can fail: reintroduce the defect, confirm the test
 fails, restore. Assert the mutation target exists before writing it — a
 no-op mutation leaves the suite green, which reads exactly like success.
 
-**Take the pre-mutation copy from git, not from the working tree, and
-confirm the restore with `git diff` rather than trusting the copy back.**
+**Commit first, then mutate, then restore with `git checkout HEAD -- <path>`
+and confirm with `git diff`.** The copy to restore from has to be the
+pre-mutation state, and the only way to be sure of that is for it to be a
+commit. A `cp` from the working tree captures whatever damage is already
+there; `git checkout --` without a committed checkpoint reverts to the
+*last* commit and silently drops the uncommitted work being tested. Both
+have happened here, one after the other.
 A mutation run that exceeds the command timeout is moved to the
 background and can be killed between editing and restoring; a later
 `cp working-tree backup` then captures the damage as the baseline and

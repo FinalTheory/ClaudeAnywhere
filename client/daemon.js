@@ -231,6 +231,26 @@ function clickByText(prefix, text) {
 `;
 }
 
+// Like clickByText, but for controls whose visible text is an icon. The
+// panel's close button renders as a glyph with the name only in
+// aria-label, so matching on textContent never found it and the panel was
+// left open on the laptop after every action.
+function clickByName(prefix, name) {
+  return `
+(function () {
+  const wanted = ${JSON.stringify(name)};
+  const els = [...document.querySelectorAll('[class*="${prefix}"]')];
+  const nameOf = (el) =>
+    (el.getAttribute('aria-label') || el.getAttribute('title') || el.textContent || '').trim();
+  const hit = els.find((el) => nameOf(el) === wanted);
+  if (!hit) return { ok: false, reason: 'not found', seen: els.map(nameOf).slice(0, 12) };
+  if (hit.disabled) return { ok: false, reason: 'disabled' };
+  hit.click();
+  return { ok: true };
+})()
+`;
+}
+
 // The server rows are not buttons with matching text — the name is in a
 // child — so this one matches on the child's text and clicks the row.
 function clickServerRow(name) {
@@ -711,8 +731,29 @@ async function openMcpPanel(run) {
 
 async function closeMcpPanel(run) {
   // Leaving the laptop parked on a panel the phone opened is its own
-  // small betrayal; best effort, never fatal.
-  await run(clickByText('iconButton_', 'Close')).catch(() => {});
+  // small betrayal. Best effort, never fatal — but verified, because the
+  // first version matched on textContent and an icon button has none, so
+  // it silently never closed anything.
+  try {
+    let out = await run(clickByName('iconButton_', 'Close'));
+    if (!out.ok) {
+      // Whatever it is called, it is the control that dismisses the panel.
+      out = await run(`
+(function () {
+  const btn = [...document.querySelectorAll('button')].find((el) => {
+    const n = (el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().toLowerCase();
+    return n === 'close' || n === 'dismiss';
+  });
+  if (!btn) return { ok: false };
+  btn.click();
+  return { ok: true };
+})()
+`);
+    }
+    await waitFor(run, MCP_STATE_EXPR, (st) => st.panel === 'none', { timeoutMs: 3000 });
+  } catch (e) {
+    // the panel staying open is untidy, not a failure of the action
+  }
 }
 
 async function readMcpServers(run) {
@@ -1286,6 +1327,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  clickByName,
   CLEAR_COMPOSER_EXPR,
   RECONNECT_BUSY_EXPR,
   CLICK_MCP_COMMAND_EXPR,

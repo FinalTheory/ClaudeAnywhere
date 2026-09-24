@@ -168,6 +168,19 @@ body > #session-detail {
   background: var(--vscode-button-secondaryBackground, rgba(255, 255, 255, 0.12));
   color: var(--vscode-foreground, #ccc);
 }
+/* A disclosure marker, so the second tap is discoverable as "put this
+   away" rather than "load it again". */
+#mcp-refresh::after {
+  content: ' ›';
+  display: inline-block;
+  transition: transform 0.12s ease-out;
+}
+#mcp-refresh.open::after {
+  transform: rotate(90deg);
+}
+#mcp-list[hidden] {
+  display: none;
+}
 .mcp-row {
   display: flex;
   align-items: center;

@@ -9,6 +9,7 @@ const assert = require('node:assert');
 
 const cdp = require('../cdp-client.js');
 const {
+  clickByName,
   CLICK_MCP_COMMAND_EXPR,
   clickByText,
   clickServerRow,
@@ -938,6 +939,11 @@ function fakeDom(nodes) {
     textContent: n.text,
     disabled: !!n.disabled,
     clicked: 0,
+    getAttribute(name) {
+      if (name === 'aria-label') return n.label || null;
+      if (name === 'title') return n.title || null;
+      return null;
+    },
     click() {
       this.clicked++;
     },
@@ -1187,4 +1193,37 @@ test('every DOM expression parses as JavaScript', () => {
       `${name} does not parse`,
     );
   }
+});
+
+// --- closing the panel ----------------------------------------------------
+// The first version matched the close control on textContent. It is an
+// icon button, so its textContent is empty and the match never hit: every
+// action left the MCP panel open on the laptop.
+
+test('clickByName: finds a control by aria-label when it has no text', () => {
+  const dom = fakeDom([{ cls: 'iconButton_YKLzCw', text: '', label: 'Close' }]);
+  const out = runExpr(clickByName('iconButton_', 'Close'), dom);
+  assert.strictEqual(out.ok, true);
+  assert.strictEqual(dom.els[0].clicked, 1);
+});
+
+test('clickByName: falls back to title, then to text', () => {
+  const byTitle = fakeDom([{ cls: 'iconButton_x', text: '', title: 'Close' }]);
+  assert.strictEqual(runExpr(clickByName('iconButton_', 'Close'), byTitle).ok, true);
+  const byText = fakeDom([{ cls: 'iconButton_x', text: 'Close' }]);
+  assert.strictEqual(runExpr(clickByName('iconButton_', 'Close'), byText).ok, true);
+});
+
+test('clickByName: a miss reports the names it saw', () => {
+  const dom = fakeDom([{ cls: 'iconButton_x', text: '', label: 'Settings' }]);
+  const out = runExpr(clickByName('iconButton_', 'Close'), dom);
+  assert.strictEqual(out.ok, false);
+  assert.deepStrictEqual(out.seen, ['Settings']);
+  assert.strictEqual(dom.els[0].clicked, 0);
+});
+
+test('clickByText would not have found the icon button — the reason clickByName exists', () => {
+  const dom = fakeDom([{ cls: 'iconButton_YKLzCw', text: '', label: 'Close' }]);
+  assert.strictEqual(runExpr(clickByText('iconButton_', 'Close'), dom).ok, false);
+  assert.strictEqual(dom.els[0].clicked, 0);
 });

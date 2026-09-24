@@ -200,6 +200,7 @@ function renderMcp(out) {
       btn.textContent = 'Reconnect';
       btn.disabled = false;
       if (res.ok) {
+        mcpListEl.hidden = false;
         refreshMcp();
       } else {
         status.textContent = res.error || 'failed';
@@ -226,7 +227,21 @@ async function refreshMcp() {
   }
 }
 
-mcpRefreshBtn.onclick = refreshMcp;
+// Tapping the header again puts the list away. It is a dozen rows on a
+// phone screen, and it is only worth looking at when something is broken.
+// Collapsing keeps the DOM so re-opening is instant and does not disturb
+// the laptop again.
+mcpRefreshBtn.onclick = () => {
+  const loaded = mcpListEl.childElementCount > 0;
+  if (loaded && !mcpListEl.hidden) {
+    mcpListEl.hidden = true;
+    mcpRefreshBtn.classList.remove('open');
+    return;
+  }
+  mcpListEl.hidden = false;
+  mcpRefreshBtn.classList.add('open');
+  if (!loaded) refreshMcp();
+};
 
 function showListNotice(heading, detail, raw) {
   const wrap = document.createElement('div');
