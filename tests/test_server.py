@@ -684,5 +684,93 @@ class PhonePingTests(AioHTTPTestCase, IsolatedState):
         self.assertEqual(server.sessions["s1"].turns, ["<p>a</p>"])
         await ws.close()
 
+
+class ActionRouteTests(AioHTTPTestCase, IsolatedState):
+    """The phone-initiated actions: new session, list MCP, reconnect MCP.
+    Each is a request/reply over the one daemon socket, routed by reqId
+    the same way the session list is."""
+
+    async def get_application(self):
+        return server.make_app()
+
+    def setUp(self):
+        IsolatedState.setUp(self)
+        AioHTTPTestCase.setUp(self)
+        server.client_ws = None
+        server.client_authed = False
+        self.addCleanup(lambda: setattr(server, "client_ws", None))
+        self.addCleanup(lambda: setattr(server, "client_authed", False))
+
+    async def daemon_that_answers(self, reply):
+        ws = await self.client.ws_connect("/ws/client")
+        await ws.send_json({"type": "hello", "token": TOKEN})
+        await asyncio.wait_for(ws.receive_json(), timeout=5)
+        seen = {}
+
+        async def responder():
+            req = await asyncio.wait_for(ws.receive_json(), timeout=5)
+            seen.update(req)
+            await ws.send_json({"type": "action_result", "reqId": req["reqId"], **reply})
+
+        return ws, asyncio.create_task(responder()), seen
+
+    async def test_new_session_forwards_the_prompt_and_returns_the_answer(self):
+        ws, task, seen = await self.daemon_that_answers({"ok": True, "sessionId": "new-1"})
+        resp = await self.client.post(
+            "/api/new-session", json={"text": "hello there"}, headers=AUTH_HEADER
+        )
+        await task
+        self.assertEqual(seen["type"], "new_session")
+        self.assertEqual(seen["text"], "hello there")
+        body = await resp.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["sessionId"], "new-1")
+        await ws.close()
+
+    async def test_a_failed_action_is_200_with_the_reason(self):
+        # The laptop answered; what it said is the useful part. A 5xx here
+        # would read as the VPS being broken.
+        ws, task, _ = await self.daemon_that_answers(
+            {"ok": False, "error": "the Claude Code panel is not open"}
+        )
+        resp = await self.client.post("/api/new-session", json={"text": "x"}, headers=AUTH_HEADER)
+        await task
+        self.assertEqual(resp.status, 200)
+        body = await resp.json()
+        self.assertFalse(body["ok"])
+        self.assertIn("panel", body["error"])
+        await ws.close()
+
+    async def test_reconnect_carries_the_server_name(self):
+        ws, task, seen = await self.daemon_that_answers({"ok": True, "status": "reconnected"})
+        await self.client.post(
+            "/api/mcp/reconnect", json={"serverName": "jira-ghe"}, headers=AUTH_HEADER
+        )
+        await task
+        self.assertEqual(seen["type"], "reconnect_mcp")
+        self.assertEqual(seen["serverName"], "jira-ghe")
+        await ws.close()
+
+    async def test_list_mcp_returns_the_servers(self):
+        ws, task, _ = await self.daemon_that_answers(
+            {"ok": True, "servers": [{"name": "jira-ghe", "status": "Failed"}]}
+        )
+        resp = await self.client.post("/api/mcp", json={}, headers=AUTH_HEADER)
+        await task
+        body = await resp.json()
+        self.assertEqual(body["servers"], [{"name": "jira-ghe", "status": "Failed"}])
+        await ws.close()
+
+    async def test_no_daemon_is_503_not_a_hang(self):
+        resp = await self.client.post("/api/mcp", json={}, headers=AUTH_HEADER)
+        self.assertEqual(resp.status, 503)
+        self.assertFalse((await resp.json())["ok"])
+
+    async def test_actions_require_auth(self):
+        for path in ("/api/new-session", "/api/mcp", "/api/mcp/reconnect"):
+            with self.subTest(path=path):
+                resp = await self.client.post(path, json={}, allow_redirects=False)
+                self.assertEqual(resp.status, 302)
+
 if __name__ == "__main__":
     unittest.main()

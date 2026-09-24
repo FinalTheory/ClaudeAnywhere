@@ -353,6 +353,14 @@ async def ws_client_handler(request: web.Request) -> web.WebSocketResponse:
             await ws.send_json({"type": "pong"})
             continue
 
+        if mtype == "action_result":
+            # Reply to a phone-initiated action, routed back by reqId the
+            # same way sessions_result is.
+            fut = pending_requests.pop(data.get("reqId"), None)
+            if fut and not fut.done():
+                fut.set_result(data)
+            continue
+
         if mtype == "sessions_result":
             fut = pending_requests.pop(data.get("reqId"), None)
             if fut and not fut.done():
@@ -400,6 +408,24 @@ async def ws_client_handler(request: web.Request) -> web.WebSocketResponse:
         client_ws = None
         client_authed = False
     return ws
+
+
+async def request_action(payload: dict, timeout: float) -> dict:
+    """Send a phone-initiated command to the daemon and wait for its
+    answer. Same request/reply-over-one-socket shape as the session list;
+    the timeout is per-action because clicking through Claude Code's own
+    UI is slower than reading a target list."""
+    req_id = next_req_id()
+    fut = asyncio.get_running_loop().create_future()
+    pending_requests[req_id] = fut
+    ok = await send_to_client({**payload, "reqId": req_id})
+    if not ok:
+        pending_requests.pop(req_id, None)
+        raise RuntimeError("client daemon not connected")
+    try:
+        return await asyncio.wait_for(fut, timeout)
+    finally:
+        pending_requests.pop(req_id, None)
 
 
 async def request_list_sessions(timeout: float = 5.0) -> dict:
@@ -496,6 +522,45 @@ async def api_history(request: web.Request) -> web.Response:
     })
 
 
+async def _action_route(request: web.Request, payload_from, timeout: float) -> web.Response:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        result = await request_action(payload_from(body), timeout)
+    except (RuntimeError, asyncio.TimeoutError) as err:
+        return web.json_response({"ok": False, "error": str(err)}, status=503)
+    # 200 even for ok:false — the laptop answered, and what it said is the
+    # useful part. A 5xx here would read as "the VPS is broken".
+    return web.json_response(result)
+
+
+@require_auth
+async def api_new_session(request: web.Request) -> web.Response:
+    return await _action_route(
+        request,
+        lambda b: {"type": "new_session", "text": str(b.get("text", ""))},
+        timeout=45.0,
+    )
+
+
+@require_auth
+async def api_list_mcp(request: web.Request) -> web.Response:
+    # Reading the list means opening Claude Code's MCP panel on the
+    # laptop, so this is only ever done when the phone asks.
+    return await _action_route(request, lambda b: {"type": "list_mcp"}, timeout=30.0)
+
+
+@require_auth
+async def api_reconnect_mcp(request: web.Request) -> web.Response:
+    return await _action_route(
+        request,
+        lambda b: {"type": "reconnect_mcp", "serverName": str(b.get("serverName", ""))},
+        timeout=60.0,
+    )
+
+
 async def ws_phone_handler(request: web.Request) -> web.WebSocketResponse:
     if not _is_authed(request):
         raise web.HTTPForbidden()
@@ -581,6 +646,9 @@ def make_app() -> web.Application:
     app.router.add_post("/login", login_page)
     app.router.add_get("/app", app_page)  # kept as an alias, in case anything still links here
     app.router.add_get("/api/sessions", api_sessions)
+    app.router.add_post("/api/new-session", api_new_session)
+    app.router.add_post("/api/mcp", api_list_mcp)
+    app.router.add_post("/api/mcp/reconnect", api_reconnect_mcp)
     app.router.add_get("/api/session/{session_id}/history", api_history)
     app.router.add_get("/ws/client", ws_client_handler)
     app.router.add_get("/ws/phone/{session_id}", ws_phone_handler)

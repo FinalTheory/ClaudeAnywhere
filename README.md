@@ -74,6 +74,7 @@ client -> VPS:
   {type:"resync", sessionId, turns}      # capped tail — VPS reconciles by
                                           # content-overlap, see apply_resync
   {type:"submit_ack", sessionId, ok, error?}
+  {type:"action_result", reqId, ok, error?, ...}   # reply to a phone action
   {type:"error", sessionId, message}
 
 VPS -> client:
@@ -82,6 +83,9 @@ VPS -> client:
   {type:"subscribe", sessionId}          # start polling this session
   {type:"unsubscribe", sessionId}        # stop polling it
   {type:"submit", sessionId, text}
+  {type:"new_session", reqId, text}         # click New session, then type
+  {type:"list_mcp", reqId}                  # open the MCP panel and read it
+  {type:"reconnect_mcp", reqId, serverName}
 ```
 
 **Phone <-> VPS** (`/ws/phone/<session_id>`, open only while that session's
@@ -100,6 +104,16 @@ VPS -> phone:
 phone -> VPS:
   {type:"submit", text}
 ```
+
+The last three drive Claude Code's own UI by clicking real controls,
+because what they trigger has no other entry point. `mcp_reconnect` is an
+Agent SDK control request carried over the anonymous socketpair between
+the VS Code extension host and that session's CLI process: `claude mcp`
+has no reconnect subcommand, the extension registers no MCP command, and
+the IDE's own WebSocket RPC (`~/.claude/ide/<port>.lock`) exposes twelve
+tools that are all editor operations. Reading the MCP list opens that
+panel on the laptop, so it happens only when the phone asks, and the
+panel is closed again afterwards.
 
 `cdp` exists because an empty session list has three causes the phone has to
 tell apart, and two of them used to look identical. `no-daemon` (the VPS

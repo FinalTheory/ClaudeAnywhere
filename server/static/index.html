@@ -11,7 +11,20 @@
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<div id="session-list"></div>
+<div id="session-list">
+  <div id="list-actions">
+    <form id="new-session-form">
+      <textarea id="new-session-input" rows="1" placeholder="Start a new conversation" autocomplete="off"></textarea>
+      <button type="submit">Start</button>
+    </form>
+    <div id="new-session-status"></div>
+    <div id="mcp-section">
+      <button id="mcp-refresh" type="button">MCP servers</button>
+      <div id="mcp-list"></div>
+    </div>
+  </div>
+  <div id="session-rows"></div>
+</div>
 <div id="session-detail" style="display:none">
   <button id="back-btn">&larr; Back</button>
   <span id="status"></span>

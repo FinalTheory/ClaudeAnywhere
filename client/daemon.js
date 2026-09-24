@@ -40,6 +40,8 @@
 //   {type:"append", sessionId, turns}   // extend what the VPS has
 //   {type:"resync", sessionId, turns}   // capped tail; VPS splices by content overlap
 //   {type:"submit_ack", sessionId, ok, error?}
+//   {type:"action_result", reqId, ok, error?, ...}  // reply to a
+//        // phone-initiated new_session / list_mcp / reconnect_mcp
 //   {type:"error", sessionId, message}
 //
 // VPS -> client:
@@ -178,6 +180,104 @@ function injectExpr(text) {
 })(${JSON.stringify(text)})
 `;
 }
+
+// --- driving Claude Code's own UI ----------------------------------------
+// Everything below clicks real controls in the webview, because the thing
+// they trigger has no other entry point: `mcp_reconnect` is an Agent SDK
+// control request carried over the anonymous socketpair between the VS
+// Code extension host and that session's CLI process, and nothing outside
+// that pipe can send it — not the CLI (`claude mcp` has no reconnect), not
+// the extension's command palette (no MCP command is registered), not the
+// IDE's own WebSocket RPC (its twelve tools are all editor operations).
+//
+// Class names are CSS-module hashed, so every selector matches on the
+// semantic prefix and the visible text, neither of which moves with a
+// build. The rule throughout: identify, verify, then act. `dangerButton_`
+// carries "Remove" and "Clear authentication" in the same row as
+// "Reconnect", so a click that lands on the wrong control is far worse
+// than one that does not happen.
+
+const q = (sel) => `[class*="${sel}"]`;
+
+// Where the MCP panel currently is, if it is anywhere.
+const MCP_STATE_EXPR = `
+(function () {
+  const t = (el) => (el ? (el.textContent || '').trim() : null);
+  const detail = document.querySelector('[class*="detailTitle_"]');
+  const rows = [...document.querySelectorAll('[class*="serverItem_"]')].map((el) => ({
+    name: t(el.querySelector('[class*="serverName_"]')),
+    status: t(el.querySelector('[class*="statusBadge_"]')),
+  })).filter((r) => r.name);
+  const menuOpen = !!document.querySelector('[class*="commandItem_"]');
+  if (detail) return { panel: 'detail', title: t(detail), rows, menuOpen };
+  if (rows.length) return { panel: 'list', title: null, rows, menuOpen };
+  return { panel: 'none', title: null, rows: [], menuOpen };
+})()
+`;
+
+// Click one control, named by prefix and exact visible text. Returns what
+// it found so a caller can tell "not there yet" from "clicked".
+function clickByText(prefix, text) {
+  return `
+(function () {
+  const wanted = ${JSON.stringify(text)};
+  const els = [...document.querySelectorAll('[class*="${prefix}"]')];
+  const hit = els.find((el) => (el.textContent || '').trim() === wanted);
+  if (!hit) return { ok: false, reason: 'not found', seen: els.map((e) => (e.textContent || '').trim()).slice(0, 12) };
+  if (hit.disabled) return { ok: false, reason: 'disabled' };
+  hit.click();
+  return { ok: true };
+})()
+`;
+}
+
+// The server rows are not buttons with matching text — the name is in a
+// child — so this one matches on the child's text and clicks the row.
+function clickServerRow(name) {
+  return `
+(function () {
+  const wanted = ${JSON.stringify(name)};
+  const rows = [...document.querySelectorAll('[class*="serverItem_"]')];
+  const hit = rows.find((el) => {
+    const n = el.querySelector('[class*="serverName_"]');
+    return n && (n.textContent || '').trim() === wanted;
+  });
+  if (!hit) return { ok: false, reason: 'no such server', seen: rows.map((el) => (el.querySelector('[class*="serverName_"]')?.textContent || '').trim()) };
+  hit.click();
+  return { ok: true };
+})()
+`;
+}
+
+// Reconnect, but only after confirming the open detail view is the server
+// that was asked for. "Remove" and "Clear authentication" sit in the same
+// row; acting on the wrong one is unrecoverable from a phone.
+function clickReconnectFor(name) {
+  return `
+(function () {
+  const wanted = ${JSON.stringify(name)};
+  const title = document.querySelector('[class*="detailTitle_"]');
+  const shown = title && (title.textContent || '').trim();
+  if (shown !== wanted) return { ok: false, reason: 'detail view shows ' + JSON.stringify(shown) + ', not ' + JSON.stringify(wanted) };
+  const btn = [...document.querySelectorAll('[class*="actionButton_"]')]
+    .find((el) => (el.textContent || '').trim() === 'Reconnect');
+  if (!btn) return { ok: false, reason: 'no Reconnect button in this detail view' };
+  if (btn.disabled) return { ok: false, reason: 'already reconnecting' };
+  btn.click();
+  return { ok: true };
+})()
+`;
+}
+
+// Claude Code's sidebar (purpose=webviewView) owns the New session button.
+const NEW_SESSION_EXPR = `
+(function () {
+  const btn = document.querySelector('[class*="newSessionButton_"]');
+  if (!btn) return { ok: false, reason: 'no New session button — is the Claude Code panel open?' };
+  btn.click();
+  return { ok: true };
+})()
+`;
 
 function stripTags(html) {
   return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
@@ -480,6 +580,135 @@ function msgType(raw) {
   }
 }
 
+// Poll `probe` until `done` says so. The UI is React: every click is
+// followed by a render nobody tells us about, so each step waits for the
+// state it expects rather than sleeping a guessed interval.
+async function waitFor(run, probe, done, { timeoutMs = 8000, everyMs = 250 } = {}) {
+  const until = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < until) {
+    last = await run(probe);
+    if (done(last)) return last;
+    await new Promise((r) => setTimeout(r, everyMs));
+  }
+  return last;
+}
+
+// One attached webview, driven step by step. `run` evaluates an
+// expression in that session's content frame.
+async function openMcpPanel(run) {
+  let state = await run(MCP_STATE_EXPR);
+  if (state.panel !== 'none') return { ok: true, state };
+
+  // The command menu, not the composer: typing "/mcp" and pressing Enter
+  // sends it as a message instead of opening anything.
+  if (!state.menuOpen) {
+    const opened = await run(clickByText('menuButton_', 'Show command menu (/)'));
+    if (!opened.ok) {
+      // The label carries a hint in parentheses and could be reworded;
+      // fall back to the only button with that class.
+      const any = await run(`
+(function () {
+  const b = document.querySelector('[class*="menuButton_"]');
+  if (!b) return { ok: false, reason: 'no command menu button' };
+  b.click();
+  return { ok: true };
+})()
+`);
+      if (!any.ok) return { ok: false, error: any.reason };
+    }
+  }
+
+  const menu = await waitFor(run, MCP_STATE_EXPR, (st) => st.menuOpen, { timeoutMs: 4000 });
+  if (!menu.menuOpen) return { ok: false, error: 'the command menu did not open' };
+
+  const picked = await run(clickByText('commandItem_', '/mcp'));
+  if (!picked.ok) {
+    const alt = await run(`
+(function () {
+  const item = [...document.querySelectorAll('[class*="commandItem_"]')]
+    .find((el) => ((el.querySelector('[class*="commandLabel_"]') || el).textContent || '').trim().startsWith('/mcp'));
+  if (!item) return { ok: false, reason: 'no /mcp entry in the command menu' };
+  item.click();
+  return { ok: true };
+})()
+`);
+    if (!alt.ok) return { ok: false, error: alt.reason };
+  }
+
+  state = await waitFor(run, MCP_STATE_EXPR, (st) => st.panel !== 'none');
+  if (state.panel === 'none') return { ok: false, error: 'the MCP panel did not open' };
+  return { ok: true, state };
+}
+
+async function closeMcpPanel(run) {
+  // Leaving the laptop parked on a panel the phone opened is its own
+  // small betrayal; best effort, never fatal.
+  await run(clickByText('iconButton_', 'Close')).catch(() => {});
+}
+
+async function readMcpServers(run) {
+  const opened = await openMcpPanel(run);
+  if (!opened.ok) return opened;
+  let state = opened.state;
+  if (state.panel === 'detail') {
+    await run(clickByText('backButton_', '← Back to list'));
+    state = await waitFor(run, MCP_STATE_EXPR, (st) => st.rows.length > 0);
+  }
+  await closeMcpPanel(run);
+  return { ok: true, servers: state.rows };
+}
+
+async function reconnectMcpServer(run, name) {
+  const opened = await openMcpPanel(run);
+  if (!opened.ok) return opened;
+  let state = opened.state;
+
+  if (state.panel === 'detail' && state.title !== name) {
+    await run(clickByText('backButton_', '← Back to list'));
+    state = await waitFor(run, MCP_STATE_EXPR, (st) => st.rows.length > 0);
+  }
+  if (state.panel !== 'detail') {
+    const row = await run(clickServerRow(name));
+    if (!row.ok) {
+      await closeMcpPanel(run);
+      return { ok: false, error: `${row.reason}${row.seen ? ` (saw: ${row.seen.join(', ')})` : ''}` };
+    }
+    state = await waitFor(run, MCP_STATE_EXPR, (st) => st.panel === 'detail' && st.title === name);
+  }
+
+  const clicked = await run(clickReconnectFor(name));
+  if (!clicked.ok) {
+    await closeMcpPanel(run);
+    return { ok: false, error: clicked.reason };
+  }
+
+  // The button reads "Reconnecting…" while in flight; settled is when it
+  // is gone. Not proof the server came back — the status badge is — but
+  // proof the request completed rather than hanging.
+  await waitFor(
+    run,
+    `
+(function () {
+  const b = [...document.querySelectorAll('[class*="actionButton_"]')]
+    .find((el) => (el.textContent || '').trim().startsWith('Reconnect'));
+  const title = document.querySelector('[class*="detailTitle_"]');
+  const badge = document.querySelector('[class*="statusBadge_"]');
+  return {
+    busy: !!b && (b.textContent || '').trim() === 'Reconnecting…',
+    status: badge ? (badge.textContent || '').trim() : null,
+    title: title ? (title.textContent || '').trim() : null,
+  };
+})()
+`,
+    (st) => !st.busy,
+    { timeoutMs: 20000 },
+  );
+  const after = await run(MCP_STATE_EXPR);
+  await closeMcpPanel(run);
+  return { ok: true, status: after.title === name ? 'reconnected' : 'done' };
+}
+
 class Daemon {
   constructor() {
     this.ws = null;
@@ -603,6 +832,27 @@ class Daemon {
       return;
     }
 
+    // Phone-initiated actions. Each answers on the same reqId the server
+    // is waiting on, so a failure reaches the phone as a sentence rather
+    // than a timeout.
+    if (msg.type === 'new_session') {
+      const result = await this.newSession(msg.text || '');
+      this._send({ type: 'action_result', reqId: msg.reqId, ...result });
+      return;
+    }
+
+    if (msg.type === 'list_mcp') {
+      const result = await this.listMcpServers();
+      this._send({ type: 'action_result', reqId: msg.reqId, ...result });
+      return;
+    }
+
+    if (msg.type === 'reconnect_mcp') {
+      const result = await this.reconnectMcp(msg.serverName);
+      this._send({ type: 'action_result', reqId: msg.reqId, ...result });
+      return;
+    }
+
     if (msg.type === 'subscribe') {
       if (this.watchers.has(msg.sessionId)) return;
       const watcher = new SessionWatcher(msg.sessionId, (event) => this._send(event));
@@ -650,6 +900,110 @@ class Daemon {
       }
       return;
     }
+  }
+
+  // Evaluate expressions in one session's content frame. Attaches for the
+  // call and closes after, like the one-shot submit path: these run on a
+  // phone tap, not on a poll.
+  async _withSession(sessionId, fn) {
+    let client;
+    try {
+      const target = await cdp.findTarget(CDP_PORT, sessionId);
+      client = await cdp.connect(target);
+      const frames = await cdp.getFrames(client);
+      const picked = await cdp.pickContentFrame(client, frames);
+      if (!picked) return { ok: false, error: 'no content frame in that session' };
+      return await fn((expr) => cdp.evaluate(client, expr, picked.contextId));
+    } catch (err) {
+      return { ok: false, error: err.message };
+    } finally {
+      try {
+        client && client.ws.close();
+      } catch (e) {
+        // already gone
+      }
+    }
+  }
+
+  // Which session to drive for an MCP action. Connections are per-session
+  // — each one is its own CLI process with its own MCP clients — so this
+  // has to name one. The visible tab is the one the author is looking at
+  // and so the one whose MCP state they mean.
+  async _mcpSessionId() {
+    const targets = await cdp.listClaudeSessions(CDP_PORT);
+    if (!targets.length) return null;
+    const pair = await cdp.readActiveWebviewTitle(
+      CDP_PORT,
+      targets.map((t) => t.sessionId)
+    );
+    return pair ? pair.webviewId : targets[0].sessionId;
+  }
+
+  async listMcpServers() {
+    const sessionId = await this._mcpSessionId();
+    if (!sessionId) return { ok: false, error: 'no Claude Code session is open' };
+    const out = await this._withSession(sessionId, (run) => readMcpServers(run));
+    return { ...out, sessionId };
+  }
+
+  async reconnectMcp(name) {
+    const sessionId = await this._mcpSessionId();
+    if (!sessionId) return { ok: false, error: 'no Claude Code session is open' };
+    const out = await this._withSession(sessionId, (run) => reconnectMcpServer(run, name));
+    return { ...out, sessionId };
+  }
+
+  // Click New session in the sidebar, wait for a webview id that was not
+  // there before, then type into it. The phone does not navigate to it —
+  // the next list refresh shows it, which is all that was asked for.
+  async newSession(text) {
+    let before;
+    try {
+      before = new Set((await cdp.listClaudeSessions(CDP_PORT)).map((t) => t.sessionId));
+    } catch (err) {
+      return { ok: false, error: `CDP unreachable: ${err.message}` };
+    }
+
+    const sidebar = await cdp.withSidebar(CDP_PORT, (run) => run(NEW_SESSION_EXPR));
+    if (!sidebar || !sidebar.ok) {
+      return { ok: false, error: sidebar ? sidebar.reason : 'the Claude Code panel is not open' };
+    }
+
+    // A new webview, not merely a new tab: id is what everything else
+    // addresses by.
+    const until = Date.now() + 15000;
+    let fresh = null;
+    while (Date.now() < until && !fresh) {
+      await new Promise((r) => setTimeout(r, 400));
+      let now;
+      try {
+        now = await cdp.listClaudeSessions(CDP_PORT);
+      } catch (err) {
+        continue;
+      }
+      fresh = now.map((t) => t.sessionId).find((id) => !before.has(id)) || null;
+    }
+    if (!fresh) return { ok: false, error: 'clicked New session but no new session appeared' };
+    if (!text) return { ok: true, sessionId: fresh };
+
+    // The new webview mounts before its composer does, so retry rather
+    // than racing it.
+    const deadline = Date.now() + 15000;
+    let last = { ok: false, reason: 'never attached' };
+    while (Date.now() < deadline) {
+      const w = new SessionWatcher(fresh, () => {});
+      try {
+        await w.attach();
+        last = await w.submit(text);
+        if (last.ok) return { ok: true, sessionId: fresh };
+      } catch (err) {
+        last = { ok: false, reason: err.message };
+      } finally {
+        w.close();
+      }
+      await new Promise((r) => setTimeout(r, 600));
+    }
+    return { ok: false, sessionId: fresh, error: `session created, but the prompt did not land: ${last.reason}` };
   }
 
   async _listSessions() {
@@ -881,6 +1235,15 @@ if (require.main === module) {
 }
 
 module.exports = {
+  openMcpPanel,
+  readMcpServers,
+  reconnectMcpServer,
+  clickByText,
+  clickServerRow,
+  clickReconnectFor,
+  waitFor,
+  MCP_STATE_EXPR,
+  NEW_SESSION_EXPR,
   shouldEmitNow,
   RESYNC_MIN_INTERVAL_MS,
   resolveTitles,

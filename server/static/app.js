@@ -1,7 +1,13 @@
 // Phone-side SPA shell: session list -> detail view -> live transcript.
 // No framework, no build step — this is a personal tool, not a product.
 
-const listEl = document.getElementById('session-list');
+const listEl = document.getElementById('session-rows');
+const newSessionForm = document.getElementById('new-session-form');
+const newSessionInput = document.getElementById('new-session-input');
+const newSessionStatus = document.getElementById('new-session-status');
+const listActionsEl = document.getElementById('list-actions');
+const mcpRefreshBtn = document.getElementById('mcp-refresh');
+const mcpListEl = document.getElementById('mcp-list');
 const detailEl = document.getElementById('session-detail');
 const transcriptEl = document.getElementById('transcript');
 const statusEl = document.getElementById('status');
@@ -44,10 +50,10 @@ const STALE_AFTER_MS = 30000;
 const DEAD_AFTER_MS = 60000;
 
 async function loadSessionList() {
-  listEl.innerHTML = '<div class="list-header">Sessions</div><div class="list-loading">Loading…</div>';
+  listEl.innerHTML = '<div class="list-loading">Loading…</div>';
   const res = await fetch('/api/sessions');
   const data = await res.json();
-  listEl.innerHTML = '<div class="list-header">Sessions</div>';
+  listEl.innerHTML = '';
   // Three ways to have no sessions, and they need different answers from
   // you. An empty list used to mean all of them.
   if (data.error || data.cdp === 'no-daemon') {
@@ -102,6 +108,126 @@ async function loadSessionList() {
   }
 }
 
+// --- new session ----------------------------------------------------------
+// The phone does not navigate into it: the daemon clicks New session in
+// Claude Code's sidebar, waits for a webview that was not there before,
+// and types the prompt in. The next list refresh shows it.
+
+async function postJson(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  return res.json();
+}
+
+function setActionStatus(el, text, kind) {
+  el.textContent = text || '';
+  el.className = kind ? `action-status ${kind}` : 'action-status';
+}
+
+newSessionForm.onsubmit = async (e) => {
+  e.preventDefault();
+  const text = newSessionInput.value.trim();
+  if (!text) return;
+  const btn = newSessionForm.querySelector('button');
+  btn.disabled = true;
+  // Clicking through a UI on another machine is slow — say what is
+  // happening rather than looking frozen for twenty seconds.
+  setActionStatus(newSessionStatus, 'Opening a new conversation…');
+  try {
+    const out = await postJson('/api/new-session', { text });
+    if (out.ok) {
+      newSessionInput.value = '';
+      newSessionInput.style.height = 'auto';
+      setActionStatus(newSessionStatus, 'Started — pull to refresh to see it', 'ok');
+      loadSessionList();
+    } else {
+      setActionStatus(newSessionStatus, out.error || 'could not start a session', 'bad');
+    }
+  } catch (err) {
+    setActionStatus(newSessionStatus, err.message, 'bad');
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+newSessionInput.addEventListener('input', () => {
+  newSessionInput.style.height = 'auto';
+  newSessionInput.style.height = `${newSessionInput.scrollHeight}px`;
+});
+
+// --- MCP servers ----------------------------------------------------------
+// Only on request. Reading the list means opening Claude Code's MCP panel
+// on the laptop, which changes what is on screen there; doing that on
+// every list load would be rude.
+
+function renderMcp(out) {
+  mcpListEl.innerHTML = '';
+  if (!out.ok) {
+    const p = document.createElement('p');
+    p.className = 'action-status bad';
+    p.textContent = out.error || 'could not read the MCP list';
+    mcpListEl.appendChild(p);
+    return;
+  }
+  if (!out.servers || !out.servers.length) {
+    const p = document.createElement('p');
+    p.className = 'action-status';
+    p.textContent = 'No MCP servers listed.';
+    mcpListEl.appendChild(p);
+    return;
+  }
+  for (const srv of out.servers) {
+    const row = document.createElement('div');
+    row.className = 'mcp-row';
+    const name = document.createElement('div');
+    name.className = 'mcp-name';
+    name.textContent = srv.name;
+    const status = document.createElement('div');
+    // Whatever Claude Code calls it — Connected, Failed, Needs
+    // authentication. Passed through rather than remapped, so a new
+    // status shows up as itself instead of as "unknown".
+    status.className = `mcp-status ${/fail|error/i.test(srv.status || '') ? 'bad' : ''}`;
+    status.textContent = srv.status || '';
+    const btn = document.createElement('button');
+    btn.textContent = 'Reconnect';
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = 'Reconnecting…';
+      const res = await postJson('/api/mcp/reconnect', { serverName: srv.name });
+      btn.textContent = 'Reconnect';
+      btn.disabled = false;
+      if (res.ok) {
+        refreshMcp();
+      } else {
+        status.textContent = res.error || 'failed';
+        status.className = 'mcp-status bad';
+      }
+    };
+    const text = document.createElement('div');
+    text.className = 'mcp-text';
+    text.append(name, status);
+    row.append(text, btn);
+    mcpListEl.appendChild(row);
+  }
+}
+
+async function refreshMcp() {
+  mcpRefreshBtn.disabled = true;
+  mcpListEl.innerHTML = '<p class="action-status">Opening the MCP panel on the laptop…</p>';
+  try {
+    renderMcp(await postJson('/api/mcp', {}));
+  } catch (err) {
+    renderMcp({ ok: false, error: err.message });
+  } finally {
+    mcpRefreshBtn.disabled = false;
+  }
+}
+
+mcpRefreshBtn.onclick = refreshMcp;
+
 function showListNotice(heading, detail, raw) {
   const wrap = document.createElement('div');
   wrap.className = 'list-error';
@@ -130,7 +256,7 @@ function openSession(sessionId) {
   hasMore = true;
   transcriptEl.innerHTML = '';
   renderedTurns = [];
-  listEl.style.display = 'none';
+  document.getElementById('session-list').style.display = 'none';
   // Must be 'flex', not 'block': #session-detail is styled as a flex column
   // (style.css) so #transcript gets a bounded height and scrolls
   // internally. An inline style here overrides the stylesheet regardless of
@@ -509,7 +635,7 @@ document.addEventListener('visibilitychange', () => {
 backBtn.onclick = () => {
   if (ws) ws.close();
   detailEl.style.display = 'none';
-  listEl.style.display = 'block';
+  document.getElementById('session-list').style.display = 'block';
   currentSessionId = null;
   loadSessionList();
 };

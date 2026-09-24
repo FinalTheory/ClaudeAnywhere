@@ -182,14 +182,14 @@ const SESSION_NAMES_EXPR = `
 })()
 `;
 
-// uuid -> conversation name, or {} when the sidebar isn't open. Never
-// throws: a missing name costs a nicer label, and is not worth failing the
-// session list over.
-async function readSessionNames(port) {
+// Run something in the Claude Code sidebar's content frame. Returns null
+// when the panel is not open — the sidebar is a webview like any other,
+// and closing the panel takes it out of the target list entirely.
+async function withSidebar(port, fn) {
   let client;
   try {
     const res = await fetch(`http://127.0.0.1:${port}/json/list`);
-    if (!res.ok) return {};
+    if (!res.ok) return null;
     const targets = await res.json();
     const sidebar = targets.find(
       (t) =>
@@ -198,14 +198,14 @@ async function readSessionNames(port) {
         t.url.includes('extensionId=Anthropic.claude-code') &&
         t.url.includes('purpose=webviewView')
     );
-    if (!sidebar) return {};
+    if (!sidebar) return null;
     client = await connect(sidebar);
     const frames = await getFrames(client);
     const picked = await pickContentFrame(client, frames);
-    if (!picked) return {};
-    return (await evaluate(client, SESSION_NAMES_EXPR, picked.contextId)) || {};
+    if (!picked) return null;
+    return await fn((expr) => evaluate(client, expr, picked.contextId));
   } catch (err) {
-    return {};
+    return null;
   } finally {
     try {
       client && client.ws.close();
@@ -213,6 +213,13 @@ async function readSessionNames(port) {
       // already gone
     }
   }
+}
+
+// uuid -> conversation name, or {} when the sidebar isn't open. Never
+// throws: a missing name costs a nicer label, and is not worth failing the
+// session list over.
+async function readSessionNames(port) {
+  return (await withSidebar(port, (run) => run(SESSION_NAMES_EXPR))) || {};
 }
 
 // The workbench's own view of "which conversation is on screen right now".
@@ -282,6 +289,7 @@ async function readActiveWebviewTitle(port, knownIds) {
 }
 
 module.exports = {
+  withSidebar,
   pickUniquePair,
   readActiveWebviewTitle,
   readSessionNames,

@@ -9,6 +9,11 @@ const assert = require('node:assert');
 
 const cdp = require('../cdp-client.js');
 const {
+  clickByText,
+  clickServerRow,
+  clickReconnectFor,
+  MCP_STATE_EXPR,
+  NEW_SESSION_EXPR,
   shouldEmitNow,
   RESYNC_MIN_INTERVAL_MS,
   resolveTitles,
@@ -912,4 +917,178 @@ test('a watcher that reattaches reports the next outage again', async (t) => {
   up = true;
   await w._tick(); // reattaches
   assert.strictEqual(w.attachFailed, false, 'the flag clears so a later outage is visible');
+});
+
+// --- driving Claude Code's own UI ----------------------------------------
+// The expressions are strings evaluated in the webview, so they are tested
+// the way injectExpr is: run them with `new Function` against a fake DOM
+// and assert what they did. That covers the part with judgment in it —
+// which element is chosen, and when the answer is "refuse".
+
+function runExpr(expr, document) {
+  // eslint-disable-next-line no-new-func
+  return new Function('document', `return (${expr});`)(document);
+}
+
+function fakeDom(nodes) {
+  // nodes: [{cls, text, disabled, children:{childCls:text}}]
+  const els = nodes.map((n) => ({
+    className: n.cls,
+    textContent: n.text,
+    disabled: !!n.disabled,
+    clicked: 0,
+    click() {
+      this.clicked++;
+    },
+    querySelector(sel) {
+      const want = sel.match(/class\*="([^"]+)"/)[1];
+      const hit = Object.entries(n.children || {}).find(([c]) => c.includes(want));
+      return hit ? { textContent: hit[1] } : null;
+    },
+  }));
+  return {
+    els,
+    querySelectorAll(sel) {
+      const want = sel.match(/class\*="([^"]+)"/)[1];
+      return els.filter((e) => e.className.includes(want));
+    },
+    querySelector(sel) {
+      return this.querySelectorAll(sel)[0] || null;
+    },
+  };
+}
+
+test('clickByText: clicks the one whose visible text matches exactly', () => {
+  const dom = fakeDom([
+    { cls: 'actionButton_IHCQeQ', text: 'Disable' },
+    { cls: 'actionButton_IHCQeQ', text: 'Reconnect' },
+    { cls: 'actionButton_IHCQeQ dangerButton_IHCQeQ', text: 'Remove' },
+  ]);
+  const out = runExpr(clickByText('actionButton_', 'Reconnect'), dom);
+  assert.strictEqual(out.ok, true);
+  assert.deepStrictEqual(dom.els.map((e) => e.clicked), [0, 1, 0], 'only Reconnect');
+});
+
+test('clickByText: a missing control reports what it saw instead of guessing', () => {
+  const dom = fakeDom([{ cls: 'actionButton_IHCQeQ', text: 'Authenticate' }]);
+  const out = runExpr(clickByText('actionButton_', 'Reconnect'), dom);
+  assert.strictEqual(out.ok, false);
+  assert.deepStrictEqual(out.seen, ['Authenticate']);
+});
+
+test('clickByText: a disabled control is not clicked', () => {
+  const dom = fakeDom([{ cls: 'actionButton_IHCQeQ', text: 'Reconnect', disabled: true }]);
+  const out = runExpr(clickByText('actionButton_', 'Reconnect'), dom);
+  assert.strictEqual(out.ok, false);
+  assert.strictEqual(dom.els[0].clicked, 0);
+});
+
+test('clickReconnectFor: refuses when the detail view is another server', () => {
+  // The whole point of verifying first. "Remove" and "Clear
+  // authentication" sit in this same row, and reconnecting the wrong
+  // server is not something a phone can undo.
+  const dom = fakeDom([
+    { cls: 'detailTitle_IHCQeQ', text: 'github' },
+    { cls: 'actionButton_IHCQeQ', text: 'Reconnect' },
+  ]);
+  const out = runExpr(clickReconnectFor('jira-ghe'), dom);
+  assert.strictEqual(out.ok, false);
+  assert.match(out.reason, /shows "github", not "jira-ghe"/);
+  assert.strictEqual(dom.els[1].clicked, 0, 'nothing was clicked');
+});
+
+test('clickReconnectFor: clicks once the title matches', () => {
+  const dom = fakeDom([
+    { cls: 'detailTitle_IHCQeQ', text: 'jira-ghe' },
+    { cls: 'actionButton_IHCQeQ', text: 'Reconnect' },
+    { cls: 'actionButton_IHCQeQ dangerButton_IHCQeQ', text: 'Remove' },
+  ]);
+  const out = runExpr(clickReconnectFor('jira-ghe'), dom);
+  assert.strictEqual(out.ok, true);
+  assert.deepStrictEqual(dom.els.map((e) => e.clicked), [0, 1, 0]);
+});
+
+test('clickReconnectFor: refuses when there is no detail view at all', () => {
+  const dom = fakeDom([{ cls: 'actionButton_IHCQeQ', text: 'Reconnect' }]);
+  const out = runExpr(clickReconnectFor('jira-ghe'), dom);
+  assert.strictEqual(out.ok, false);
+  assert.strictEqual(dom.els[0].clicked, 0);
+});
+
+test('clickServerRow: matches on the name child, clicks the row', () => {
+  const dom = fakeDom([
+    { cls: 'serverItem_IHCQeQ', text: 'github Connected', children: { serverName_: 'github' } },
+    { cls: 'serverItem_IHCQeQ', text: 'jira-ghe Failed', children: { serverName_: 'jira-ghe' } },
+  ]);
+  const out = runExpr(clickServerRow('jira-ghe'), dom);
+  assert.strictEqual(out.ok, true);
+  assert.deepStrictEqual(dom.els.map((e) => e.clicked), [0, 1]);
+});
+
+test('clickServerRow: an unknown name lists what is there', () => {
+  const dom = fakeDom([
+    { cls: 'serverItem_IHCQeQ', text: 'github', children: { serverName_: 'github' } },
+  ]);
+  const out = runExpr(clickServerRow('nope'), dom);
+  assert.strictEqual(out.ok, false);
+  assert.deepStrictEqual(out.seen, ['github']);
+});
+
+test('MCP_STATE_EXPR: reads the list view', () => {
+  const dom = fakeDom([
+    { cls: 'serverItem_IHCQeQ', text: '', children: { serverName_: 'github', statusBadge_: 'Connected' } },
+    { cls: 'serverItem_IHCQeQ', text: '', children: { serverName_: 'jira-ghe', statusBadge_: 'Failed' } },
+  ]);
+  const out = runExpr(MCP_STATE_EXPR, dom);
+  assert.strictEqual(out.panel, 'list');
+  assert.deepStrictEqual(out.rows, [
+    { name: 'github', status: 'Connected' },
+    { name: 'jira-ghe', status: 'Failed' },
+  ]);
+});
+
+test('MCP_STATE_EXPR: a detail view outranks the rows behind it', () => {
+  const dom = fakeDom([
+    { cls: 'detailTitle_IHCQeQ', text: 'jira-ghe' },
+    { cls: 'serverItem_IHCQeQ', text: '', children: { serverName_: 'github' } },
+  ]);
+  const out = runExpr(MCP_STATE_EXPR, dom);
+  assert.strictEqual(out.panel, 'detail');
+  assert.strictEqual(out.title, 'jira-ghe');
+});
+
+test('MCP_STATE_EXPR: no panel is "none", not an empty list', () => {
+  assert.strictEqual(runExpr(MCP_STATE_EXPR, fakeDom([])).panel, 'none');
+});
+
+test('NEW_SESSION_EXPR: says the panel is closed rather than silently doing nothing', () => {
+  const out = runExpr(NEW_SESSION_EXPR, fakeDom([]));
+  assert.strictEqual(out.ok, false);
+  assert.match(out.reason, /Claude Code panel open\?/);
+});
+
+test('NEW_SESSION_EXPR: clicks the sidebar button when it is there', () => {
+  const dom = fakeDom([{ cls: 'newSessionButton_djirOA', text: 'New session' }]);
+  assert.strictEqual(runExpr(NEW_SESSION_EXPR, dom).ok, true);
+  assert.strictEqual(dom.els[0].clicked, 1);
+});
+
+test('clickByText: exact text, not a substring', () => {
+  // "Reconnecting…" starts with "Reconnect", and the command menu can
+  // hold several entries sharing a prefix. A loose match would click the
+  // in-flight button or the wrong command.
+  const dom = fakeDom([
+    { cls: 'actionButton_IHCQeQ', text: 'Reconnect all servers' },
+    { cls: 'actionButton_IHCQeQ', text: 'Reconnect' },
+  ]);
+  const out = runExpr(clickByText('actionButton_', 'Reconnect'), dom);
+  assert.strictEqual(out.ok, true);
+  assert.deepStrictEqual(dom.els.map((e) => e.clicked), [0, 1], 'the exact one');
+});
+
+test('clickByText: an in-flight Reconnecting… is not mistaken for Reconnect', () => {
+  const dom = fakeDom([{ cls: 'actionButton_IHCQeQ', text: 'Reconnecting…', disabled: true }]);
+  const out = runExpr(clickByText('actionButton_', 'Reconnect'), dom);
+  assert.strictEqual(out.ok, false);
+  assert.strictEqual(dom.els[0].clicked, 0);
 });

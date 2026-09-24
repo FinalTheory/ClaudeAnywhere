@@ -107,6 +107,93 @@ body > #session-detail {
   color: var(--vscode-button-foreground, #fff);
 }
 
+/* The two phone-initiated actions, above the session rows. Both drive
+   Claude Code's own UI on the laptop, so both are slow enough to need a
+   visible in-progress state. */
+#list-actions {
+  padding: 12px 16px 4px;
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.2));
+}
+#new-session-form {
+  display: flex;
+  gap: 8px;
+}
+#new-session-input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 18px;
+  border: 1px solid var(--vscode-input-border, #444);
+  background: var(--vscode-input-background, #2a2a2a);
+  color: var(--vscode-input-foreground, #eee);
+  font-size: var(--app-input-font-size);
+  font-family: inherit;
+  resize: none;
+  max-height: 30vh;
+  overflow-y: auto;
+  line-height: 1.35;
+}
+#new-session-form button,
+#mcp-refresh,
+.mcp-row button {
+  flex: none;
+  padding: 8px 14px;
+  border-radius: 14px;
+  border: none;
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #fff);
+  font-size: calc(13px * var(--app-font-scale));
+}
+#new-session-form button:disabled,
+#mcp-refresh:disabled,
+.mcp-row button:disabled {
+  opacity: 0.5;
+}
+.action-status {
+  margin: 6px 2px 0;
+  font-size: calc(12px * var(--app-font-scale));
+  color: var(--vscode-descriptionForeground, #9aa);
+}
+.action-status.ok {
+  color: var(--vscode-charts-green, #3fb950);
+}
+.action-status.bad {
+  color: var(--vscode-errorForeground, #f48771);
+  overflow-wrap: anywhere;
+}
+#mcp-section {
+  margin-top: 12px;
+}
+#mcp-refresh {
+  background: var(--vscode-button-secondaryBackground, rgba(255, 255, 255, 0.12));
+  color: var(--vscode-foreground, #ccc);
+}
+.mcp-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.12));
+}
+.mcp-text {
+  flex: 1;
+  min-width: 0;
+}
+.mcp-name {
+  font-size: calc(14px * var(--app-font-scale));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mcp-status {
+  font-size: calc(11px * var(--app-font-scale));
+  color: var(--vscode-descriptionForeground, #9aa);
+  overflow-wrap: anywhere;
+}
+.mcp-status.bad {
+  color: var(--vscode-errorForeground, #f48771);
+}
+
 .session-item {
   display: flex;
   align-items: center;
