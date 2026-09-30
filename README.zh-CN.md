@@ -4,40 +4,40 @@
 
 <h1 align="center">ClaudeAnywhere</h1>
 
-<p align="center"><strong>在手机上,接着用你笔记本里那个 Claude Code 对话。</strong></p>
+<p align="center"><strong>带上自己的 Claude Remote,走到哪儿用到哪儿。</strong></p>
 
 <p align="center">
   <a href="README.md">English</a> · <a href="README.zh-CN.md">中文</a>
 </p>
 
-不是另开一个会话,也不是在浏览器里塞一个终端。ClaudeAnywhere 挂到你自己 VS Code 里正在运行的那个 Claude Code 窗口上,镜像的就是**那一个**对话:同样的历史、同样的上下文、同样那个正在跑的任务。你在手机上读它、往里打字,发出去的内容落进你离开时开着的那个窗口。
+它不新开会话,也不是往浏览器里塞一个终端。ClaudeAnywhere 挂在你自己 VS Code 那个 Claude Code 窗口上,你在手机上看到的就是它:一样的历史,一样的上下文,一样那个正跑着的任务。手机上打的字,会落进你离开时开着的那个窗口。
 
-所有环节都跑在你自己的机器上——你的笔记本,加上你自己 VPS 上的一个小中继。中间没有任何第三方服务。
+**很多公司不让用官方托管的 Remote Control**,通常是数据策略的原因。ClaudeAnywhere 能力一样,只是不经手别人:你的笔记本,你 VPS 上一个很小的中继,一个你自己生成的密钥。数据不出你自己的机器,中间也没有第三方服务。
 
-> 与 Anthropic 无关,也未获其背书。这是一个独立项目,不是 Claude Code 自带的 Remote Control 功能。
+> 与 Anthropic 无关,也未获其背书。这是一个独立项目,不是 Claude Code 自带的 Remote Control。
 
-## 为什么你可能需要它
+## 它能解决什么
 
-- **长任务不必把你拴在桌前。** 让它跑起来就走,在公交车上看着,第九分钟它提问时顺手回一句。
-- **是同一个对话。** 那些驱动一个全新 headless 会话的工具,没法把你已经开着的那个连同上下文和做了一半的活儿给你看。这个可以。
-- **它能按那些根本没有 API 的按钮。** 比如重连一个 MCP server,这件事只作为界面上的一个控件存在——没有 CLI 命令,扩展没注册对应命令,IDE 的 RPC 里也没有。ClaudeAnywhere 点的是那个真实控件。
-- **端到端自托管。** 你的笔记本只和你的 VPS 说话。一个密钥,由你自己生成。
+- **长任务不用守着。** 开跑就走,路上瞄两眼,它第九分钟提问的时候顺手答一句。
+- **就是原来那个对话。** 别的工具都是另起一个 headless 会话,你之前聊到哪、做了一半的活儿,它看不见。这个看得见。
+- **能点那些没有 API 的按钮。** 比如 MCP server 断了要重连,这事只有界面上一个按钮能干:CLI 没这个命令,扩展没注册,IDE 的 RPC 里也没有。ClaudeAnywhere 点的就是那个按钮。
+- **全套自托管。** 笔记本只连你的 VPS,没有别的出口。公司不让用托管服务的话,这套东西能力相同,但机器都是你自己的。
 
-## 在手机上能做什么
+## 手机上能干什么
 
-- 实时阅读任意一个打开的对话,包括正在流式输出的回复。
+- 实时看任意一个开着的对话,回复流式输出的过程也看得到。
 - 往里发消息。
-- 看到 Claude 是在干活还是在等你。
-- 新建一个对话,并带上第一条 prompt。
-- 列出 MCP server,重连掉线的那个。
+- 知道 Claude 是在跑还是在等你。
+- 新开一个对话,顺带把第一句话发进去。
+- 列出 MCP server,把掉线的那个重连上。
 
-## 你需要什么
+## 需要准备什么
 
-- 一台装了 Claude Code 扩展、运行 VS Code 的笔记本。
-- 一台有域名和 HTTPS 的小 VPS(前面挂 Caddy 或 nginx,见下文)。
+- 一台笔记本,装了 VS Code 和 Claude Code 扩展。
+- 一台小 VPS,有域名,前面挂 Caddy 或 nginx 做 HTTPS(下面会说为什么必须)。
 - 笔记本上 Node 22+,VPS 上 Python 3.11+。
 
-## 安装
+## 装起来
 
 ```bash
 git clone <your-fork> claude-anywhere
@@ -45,59 +45,59 @@ cd claude-anywhere
 make setup
 ```
 
-这会写出 `client/.env` 和 `server/.env`,并装好服务端依赖。然后打开这两个文件,把 `AUTH_TOKEN` 设成**同一个值**——它既是 daemon 的凭据,也是你手机端的密码,故意做成一个密钥:
+这一步会生成 `client/.env` 和 `server/.env`,顺便装好服务端依赖。接着把两个文件里的 `AUTH_TOKEN` 改成**同一个值**。它既是 daemon 的凭据,也是你手机登录的密码——故意只设一个,少一样东西要记:
 
 ```bash
 openssl rand -hex 32
 ```
 
-同时把 `client/.env` 里的 `VPS_WS_URL` 改成你中继的 WebSocket 地址。
+`client/.env` 里的 `VPS_WS_URL` 也改成你中继的地址。
 
-**在 VPS 上**,把中继放到 TLS 后面再启动:
+**VPS 这边**,先把 TLS 架好再启动:
 
 ```bash
 make server
 ```
 
-`server.py` 监听的是一个没有 TLS 的裸 HTTP/WebSocket 端口,你的密码会以明文穿过这条连接。请用 Caddy 或 nginx 在前面终结 `https://` 和 `wss://`。不要把裸端口直接暴露出去。
+`server.py` 监听的是裸 HTTP/WebSocket,自己不做 TLS,你的密码会明文走过去。所以务必用 Caddy 或 nginx 在前面终结 `https://` 和 `wss://`,别把裸端口直接放出去。
 
-**在笔记本上**,VS Code 必须带着调试端口启动——这个开关事后补不上:
+**笔记本这边**,VS Code 必须带调试端口启动,这个开关起来之后就补不上了:
 
 ```bash
-make vscode     # 退出 VS Code,带调试端口重新拉起
+make vscode     # 退掉 VS Code,带调试端口重新拉起
 make client     # 桥接进程
 ```
 
-然后在手机上打开 `https://your-relay.example.com/`,用同一个 `AUTH_TOKEN` 作为密码登录,挑一个对话。
+然后手机打开 `https://your-relay.example.com/`,密码就是刚才那个 `AUTH_TOKEN`,选一个对话进去。
 
-卡住了?`make check` 会告诉你三条链路里哪条断了——调试端口、两个 `.env`、还是中继。
+哪一步不通,跑 `make check`。它会分别告诉你调试端口、两个 `.env`、中继这三处哪里出了问题。
 
-## 工作原理
+## 怎么做到的
 
 ```
 笔记本上的 VS Code
-   └── Claude Code 窗口 ──CDP──► client/daemon.js  (你的笔记本)
+   └── Claude Code 窗口 ──CDP──► client/daemon.js  (笔记本)
                                        │ WebSocket
                                        ▼
-                                 server/server.py  (你的 VPS)
+                                 server/server.py  (VPS)
                                        │ WebSocket / HTTPS
                                        ▼
-                                   手机浏览器
+                                    手机浏览器
 ```
 
-daemon 通过 Chrome DevTools Protocol 挂到 VS Code 自己的渲染进程上,从活页面里读出对话内容,只把变化的部分发出去。中继为每个对话保留一份副本,这样你的手机才能往上翻;同时把你的消息送回另一端。daemon 只盯着当前有手机打开的对话——关掉那个页面,它就完全停止轮询。
+daemon 用 Chrome DevTools Protocol 挂到 VS Code 的渲染进程上,直接从活页面里把对话读出来,只发变动的部分。中继给每个对话存一份,这样手机才翻得回去;你发的消息也走它送回来。没有手机开着的对话,daemon 根本不去轮询。
 
-## 依赖它之前值得知道的
+## 用之前最好知道这些
 
-- **它读的是一个闭源扩展的页面。** Claude Code 随时可以在任何一个版本里改动它的标记,改了就会有东西坏掉。这一点是按"**坏得响亮**"来设计的:选择器一旦匹配不上,你的手机会明说,而不是给你看一个空对话。
-- **历史有上限**,每个对话 1MB(`MAX_SESSION_BYTES`),超出后从最旧的开始丢。往上翻到此为止。
-- **一台笔记本,一个用户。** 第二个 daemon 连上来会顶掉第一个。
-- **对话是用它的 VS Code 标签页来标识的。** 关掉再打开,或者重启 VS Code,都算成一个新的。
-- **手机端无法回答交互式选择题**——Claude Code 用自己的选择器渲染的那类提问,你能看见问题,但选择仍然要在笔记本上完成。
+- **它读的是闭源扩展的页面。** Claude Code 哪个版本改了 DOM,这边就会坏。所以它是奔着**坏得让你立刻知道**去做的:选择器一旦对不上,手机上会直说,而不是给你看一个空对话。
+- **历史有上限**,每个对话 1MB(`MAX_SESSION_BYTES`),满了从最旧的开始扔。往上翻到这儿为止。
+- **一台笔记本,一个人用。** 第二个 daemon 连上来会把第一个顶掉。
+- **对话是按 VS Code 标签页认的。** 关掉重开,或者重启 VS Code,就算另一个对话了。
+- **交互式选择题手机上答不了。** Claude Code 用自己的选择器弹出来的那种问题,你看得见,但得回电脑上选。
 
 ## 参与开发
 
-架构、wire protocol、这份代码被要求达到的标准,以及怎么跑测试,都在 [AGENTS.md](AGENTS.md)。
+架构、wire protocol、这份代码的质量标准、怎么跑测试,都在 [AGENTS.md](AGENTS.md) 里。
 
 ```bash
 make test

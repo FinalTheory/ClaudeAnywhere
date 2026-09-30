@@ -4,7 +4,7 @@
 
 <h1 align="center">ClaudeAnywhere</h1>
 
-<p align="center"><strong>Your laptop's Claude Code conversation, on your phone.</strong></p>
+<p align="center"><strong>Bring your own Claude Remote and work from anywhere you want.</strong></p>
 
 <p align="center">
   <a href="README.md">English</a> · <a href="README.zh-CN.md">中文</a>
@@ -12,7 +12,7 @@
 
 Not a second session. Not a terminal in a browser. ClaudeAnywhere attaches to the Claude Code window running in your own VS Code and mirrors *that* conversation: the same history, the same context, the same running task. You read it on your phone and you type into it, and what you send arrives in the window you left open.
 
-Everything runs on machines you own — your laptop, and a small relay on your own VPS. No third-party service sits in the middle.
+**Plenty of companies don't permit Claude Code's hosted Remote Control**, usually on data-policy grounds. ClaudeAnywhere gives you the same reach without the hosted part: your laptop, a small relay on your own VPS, one secret you generate yourself. Nothing leaves machines you control, and there is no third-party service in the middle.
 
 > Not affiliated with or endorsed by Anthropic. This is an independent project and is not Claude Code's own Remote Control feature.
 
@@ -27,7 +27,8 @@ Everything runs on machines you own — your laptop, and a small relay on your o
   example, exists only as a control in the UI — no CLI command, no extension
   command, nothing on the IDE's RPC. ClaudeAnywhere clicks the real control.
 - **Self-hosted end to end.** Your laptop talks to your VPS and nothing else.
-  One secret, which you generate.
+  One secret, which you generate. If a hosted remote is off the table where
+  you work, this is the same capability on hardware you already answer for.
 
 ## What you can do from the phone
 
