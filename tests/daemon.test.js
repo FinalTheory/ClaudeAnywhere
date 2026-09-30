@@ -7,7 +7,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-const cdp = require('../cdp-client.js');
+const cdp = require('../client/cdp-client.js');
 const {
   openMcpPanel,
   SessionQueue,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """VPS relay server: bridges the phone web UI to the client daemon running on
-the laptop, over one persistent WebSocket. See remote/README.md for the wire
-protocol this implements (mirrors remote/client/daemon.js's comment block).
+the laptop, over one persistent WebSocket. See AGENTS.md for the wire
+protocol this implements (mirrors client/daemon.js's comment block).
 
 Run:
     pip install -r requirements.txt

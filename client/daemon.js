@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Client daemon: bridges local CDP (VS Code / Claude Code webviews) to a VPS
 // relay server over one persistent outbound WebSocket. Zero npm dependencies
-// — uses Node's native fetch/WebSocket, same as the rest of remote/. Run with
+// — uses Node's native fetch/WebSocket, same as the rest of ClaudeAnywhere. Run with
 // `node --watch --env-file=.env daemon.js` (cp .env.example .env first) for
 // auto-restart on save; reconnect-with-backoff on the VPS link makes that
 // safe (see Daemon.connect below). `--env-file` is Node's own built-in flag
@@ -13,7 +13,7 @@
 //   CDP_PORT       default 9222
 //   POLL_INTERVAL_MS  default 1500 — cadence for subscribed sessions only;
 //                      unsubscribed sessions cost nothing between list calls
-//   DEPLOY_TARGET     optional, e.g. user@vps.example.com:/opt/claude-remote/server
+//   DEPLOY_TARGET     optional, e.g. you@your-relay.example.com:/opt/claude-anywhere
 //                      — if set, also watches ../server and rsyncs it there
 //                      on change, so one `node --watch` loop deploys both
 //                      sides. Uses your own SSH key/agent, same as running
@@ -86,7 +86,7 @@ function installFileLogging() {
 // so a test can substitute one of these without the binding having been
 // captured at require time. That seam is the only way submit()/attach()
 // are reachable without a live Chrome.
-const cdp = require('../cdp-client');
+const cdp = require('./cdp-client');
 
 // Validated rather than coerced. `Number("1500ms")` is NaN, and NaN
 // reaches setTimeout as 1 — a 1ms poll spin that hammers CDP and appends

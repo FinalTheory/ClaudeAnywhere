@@ -1,9 +1,9 @@
-# Agent guide — remote/
+# Agent guide — ClaudeAnywhere
 
-A personal tool that mirrors and drives Claude Code sessions running in the
-author's desktop VS Code from a phone. Own git repo, not part of
-`eviworkspace`'s. See [`README.md`](README.md) for how it works, the wire
-protocol, and how to run it.
+Mirrors and drives the Claude Code conversations already open in the
+author's desktop VS Code, from a phone. [`README.md`](README.md) is the
+user-facing half — what it is, what you need, how to run it. Everything
+below is for someone changing it.
 
 ```
 VS Code webview ──CDP──► client/daemon.js ──WS──► server/server.py ──WS/HTTP──► phone
@@ -138,20 +138,28 @@ notice when it does**. Silent failure is the one to design against.
 ## Layout
 
 ```
-cdp-client.js            shared CDP client
-list-targets.js, scan-frames.js, read-transcript*.js, send-prompt.js,
-detect-running-state.js, verify-push.js
-                         manual CDP debugging tools, gitignored
-client/daemon.js         laptop bridge; also rsyncs server/ to the VPS on save
-server/server.py         VPS relay
-server/static/           phone web UI, no build step
-tests/                   deliberately outside server/ — deploy-watch rsyncs
-                         server/ to production on every change
+Makefile             every command anyone needs to run, so they are not
+                     only described in prose that drifts
+client/
+  cdp-client.js      CDP transport: attach, evaluate, frame and target picking
+  daemon.js          the laptop bridge; also rsyncs server/ to the VPS on save
+server/
+  server.py          the VPS relay
+  static/            phone web UI, no build step
+tests/               deliberately outside server/ — deploy-watch rsyncs
+                     server/ to production on every change, so a test file
+                     there would ship and restart it on every edit
 ```
+
+The repo root holds no source. Anything appearing there is a CDP spike, a
+probe script or a captured dump, and `.gitignore` excludes the root by
+pattern rather than by name — the list of names was always one debugging
+session out of date.
 
 ## Tests
 
 ```bash
+make test                          # both, which is what CI would run if there were any
 node --test "tests/*.test.js"      # daemon + cdp-client + phone state machine
 python3 tests/test_server.py       # server: pure logic, HTTP, WS flows
 ```
@@ -217,6 +225,194 @@ perfectly good string, and the failure surfaces as an opaque CDP
 exception on someone's phone. One test evaluates every expression with
 `new Function`, including the generated ones against an argument full of
 quotes, backslashes and `${}`.
+
+## What Claude Code's webview actually does
+
+Verified by spiking against a live instance before any of this was built.
+None of it is documented anywhere, and all of it would be expensive to
+re-derive.
+
+- Multiple Claude Code tabs stay attachable over CDP at once, whichever is
+  focused — VS Code keeps hidden webviews' content alive.
+- Cmd+Enter submits a prompt. Plain Enter does not.
+- The send button's `aria-label` flips between `"Send message"` and
+  `"Stop"`, and that is the busy/idle signal. `aria-busy` and
+  spinner-class heuristics do **not** change between states.
+- CDP push (`Runtime.addBinding` + `MutationObserver`) works, but fires on
+  every DOM mutation and answers "is it finished" no better than polling
+  the signal above. Not used.
+
+## Wire protocol
+
+Two independent links, both JSON text frames over WebSocket.
+
+**Client daemon <-> VPS** (`/ws/client`):
+
+Content is always an array of **turns** — complete, independently-valid HTML
+fragments, one per `[class*="turn_"]` element in the captured DOM — never a
+single flat HTML string. This is load-bearing: slicing/capping a flat string
+by byte offset cuts through tag nesting and produces malformed fragments
+(confirmed in practice once lazy-loading shipped); slicing by whole turns is
+always well-formed no matter where the cut falls. See daemon.js's POLL_EXPR
+comment and server.py's SessionState for the details.
+
+```
+client -> VPS:
+  {type:"hello", token}
+  {type:"sessions_result", reqId, sessions:[...], cdp:"ok"|"unreachable", cdpError?}
+  {type:"state", sessionId, running}
+  {type:"append", sessionId, turns}      # extend what VPS has
+  {type:"resync", sessionId, turns}      # capped tail — VPS reconciles by
+                                          # content-overlap, see apply_resync
+  {type:"submit_ack", sessionId, ok, error?}
+  {type:"action_result", reqId, ok, error?, ...}   # reply to a phone action
+  {type:"error", sessionId, message}     # once per outage, not per poll
+  {type:"recovered", sessionId}          # its counterpart: the attach came
+                                          # back. Without it the outage
+                                          # notice is the last word, since
+                                          # an unchanged session sends
+                                          # nothing else afterwards
+  {type:"pong"}
+
+VPS -> client:
+  {type:"auth_ok"} / {type:"auth_failed"}
+  {type:"list_sessions", reqId}
+  {type:"subscribe", sessionId}          # start polling this session
+  {type:"unsubscribe", sessionId}        # stop polling it
+  {type:"submit", sessionId, text}
+  {type:"new_session", reqId, text}         # click New session, then type
+  {type:"list_mcp", reqId, sessionId?}      # open the MCP panel and read it
+  {type:"reconnect_mcp", reqId, serverName, sessionId?}
+  {type:"ping"}
+```
+
+`sessionId` on the two MCP frames is optional and is the phone answering a
+refusal. The daemon picks the conversation in front when it can tell; when
+it cannot — a split editor, or no Claude tab on screen, which is the
+ordinary state when nobody is at the laptop — it refuses rather than
+guessing and returns the candidates, and the phone names one.
+
+**Phone <-> VPS** (`/ws/phone/<session_id>`, open only while that session's
+detail view is on screen):
+
+```
+VPS -> phone:
+  {type:"initial", turns, startIndex, running}  # tail window, sent once
+  {type:"state", running}
+  {type:"append", turns}
+  {type:"resync", turns, startIndex}     # same tail-window cap as initial —
+                                          # reset your pagination cursor to
+                                          # startIndex, don't just append
+  {type:"submit_ack", ok, error?}        # to the socket that submitted,
+                                          # in order — broadcast, a second
+                                          # tab disowns its own message
+  {type:"error", message}                # forwarded from the daemon
+  {type:"recovered"}                     # and its counterpart
+  {type:"laptop", connected}             # the VPS lost or regained the
+                                          # daemon. The phone's own ping
+                                          # only proves the VPS is up
+  {type:"pong"}
+
+phone -> VPS:
+  {type:"submit", text}
+  {type:"ping"}                          # iOS suspends a backgrounded tab
+                                          # and the socket comes back OPEN
+                                          # but dead; protocol-level pings
+                                          # are answered below the
+                                          # WebSocket API, where page code
+                                          # cannot see them
+```
+
+The last three drive Claude Code's own UI by clicking real controls,
+because what they trigger has no other entry point. `mcp_reconnect` is an
+Agent SDK control request carried over the anonymous socketpair between
+the VS Code extension host and that session's CLI process: `claude mcp`
+has no reconnect subcommand, the extension registers no MCP command, and
+the IDE's own WebSocket RPC (`~/.claude/ide/<port>.lock`) exposes twelve
+tools that are all editor operations. Reading the MCP list opens that
+panel on the laptop, so it happens only when the phone asks, and the
+panel is closed again afterwards.
+
+`cdp` exists because an empty session list has three causes the phone has to
+tell apart, and two of them used to look identical. `no-daemon` (the VPS
+cannot reach the laptop at all, HTTP 503) was already distinguishable;
+`unreachable` (the daemon is up, nothing answered on port 9222 — VS Code
+closed, restarting, or launched without `--remote-debugging-port`) and `ok`
+with an empty list (VS Code running, no Claude Code tabs) were both just
+"no sessions".
+
+`startIndex` is the absolute index (into the server's stored turns list) of
+the oldest turn in that message — the cursor `/api/session/<id>/history` scroll-up
+pagination uses (`before_index`, `limit_bytes` query params, returns
+`{turns, has_more, start_index}`).
+
+Subscribe/unsubscribe is refcounted by "does any phone websocket currently
+have this session open" — the daemon only polls sessions someone is actually
+looking at. Nobody watching = zero daemon-side polling, zero traffic on the
+VPS link.
+
+## Design notes / where the numbers are
+
+- `INITIAL_LOAD_BYTES` (server env, default 2048) — target size (in whole
+  turns, rounded up to include whichever turn crosses the threshold, via
+  `tail_window()`) for the tail context a phone gets immediately on opening
+  a session; scrolling up pages further back via
+  `/api/session/<id>/history?before_index=&limit_bytes=`.
+- `MAX_SESSION_BYTES` (server env, default 1MB) — per-session cap on
+  retained turns; oldest *whole* turns dropped once the combined size
+  exceeds this (never a partial turn — that would reintroduce the malformed-
+  HTML problem this design exists to avoid). This is also the real ceiling
+  on "scroll all the way to the top" — history older than this (or older
+  than whenever the daemon started watching, whichever is more recent) is
+  gone, not just unpaginated. Three review rulings (F1.2, F5.1, F12.5)
+  decline work on the grounds that the defect is unreachable below this
+  number, so raising it widens what they left uncovered.
+- No HTML sanitization, no CSS extraction from the Claude Code webview — by
+  design, this is a single-user personal tool (the CSS actually is Claude
+  Code's own, copied from the installed extension — see
+  `server/static/claude-webview.css` and `vscode-vars.css`). `app.js` inserts
+  captured HTML via `.innerHTML =`, which as a side effect of how browsers
+  parse it won't execute embedded `<script>` tags — not a deliberate
+  security control, just noting it. Class names are CSS-module-hashed with a
+  semantic prefix (e.g. `turn_07S1Yg`, `sendButton_gGYT1w`) — `style.css`
+  matches on the prefix via `[class*="turn_"]` so it survives the hash
+  suffix changing across versions; the prefix itself isn't guaranteed stable
+  long-term either.
+- Session identity (`sessionId`) is the VS Code webview's own `id=` query
+  param — stable for that tab's lifetime, gone if the tab is closed and
+  reopened (or VS Code restarts).
+- One connected client daemon assumed throughout (single laptop). A second
+  one connecting replaces the first's WebSocket rather than erroring.
+- The phone's WebSocket reconnects with backoff on its own (`app.js`) — this
+  is load-bearing, not cosmetic, because the VPS restarts on every deploy.
+- **Only the VPS persists anything — that's deliberate, one copy, not two.**
+  The daemon is a stateless bridge: it re-reads VS Code's live DOM on every
+  restart and has no reason to remember anything across restarts, since the
+  actual source of truth (VS Code) is right there. This only works because
+  every fresh `SessionWatcher` forces its *first* poll result out as a
+  `resync`, not a diff — without that, `''.startsWith('')` being vacuously
+  true would make a fresh watcher report its first full-content read as an
+  "append", and the VPS would concatenate a full duplicate snapshot onto its
+  one persisted copy on every single daemon restart. Symmetrically, the VPS
+  re-issues `subscribe` for every session a phone is still watching as soon
+  as a daemon (re)authenticates — otherwise a daemon restart would leave
+  those sessions silently unwatched until someone manually reopens them.
+
+## What's still untested end-to-end
+
+The suites cover the protocol, the daemon's pure logic and the phone's
+state machine offline; what none of them touch is the real world. Both
+stub CDP and the network, so nothing here has met a live VS Code, a real
+reverse proxy, or an iOS Safari. Sixteen review rounds found no defect
+involving time, size or accumulation, which most likely means the method
+cannot see that class rather than that it is absent — no test runs longer
+than sixteen seconds or against more than a handful of turns.
+
+Worth a real session with the phone in hand: cookie and WebSocket
+handshake interplay across the reverse proxy; behaviour over hours rather
+than minutes (log growth, memory, the 30-day cookie actually expiring);
+and the one-shot-attach path in `daemon.js`'s `submit` handler for a
+session that is not currently subscribed.
 
 ## Conventions
 

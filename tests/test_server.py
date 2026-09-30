@@ -1,4 +1,4 @@
-"""Run: python3 -m unittest discover -s tests -v   (from remote/)
+"""Run: python3 -m unittest discover -s tests -v   (from the repo root)
 
 Lives outside server/ on purpose: the daemon's deploy-watch rsyncs server/
 to the VPS on every change, and tests have no business shipping there or

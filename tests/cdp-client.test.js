@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { listClaudeSessions, findTarget, pickUniquePair, makeSend } = require('../cdp-client.js');
+const { listClaudeSessions, findTarget, pickUniquePair, makeSend } = require('../client/cdp-client.js');
 
 function withFetch(t, payload, { status = 200 } = {}) {
   const calls = [];

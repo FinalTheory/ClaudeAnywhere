@@ -6,37 +6,23 @@ server/.env
 client/daemon.log
 server/data/
 **/__pycache__/
+node_modules/
 
 # Vendored from the installed Claude Code extension
 # (server/static/claude-webview.css) — not our code, version-specific,
-# ~400KB. Re-copy from
-# ~/.vscode-server/extensions/anthropic.claude-code-*/webview/index.css
-# when setting this up fresh; see README.
+# ~400KB. Re-copy from the extension's webview/index.css when setting this
+# up fresh; see AGENTS.md.
 server/static/claude-webview.css
 
-# CDP spike/debugging tools — already served their purpose (see README's
-# "confirmed empirically" section). cdp-client.js is a real dependency
-# (daemon.js requires it) and stays tracked; these don't.
-/detect-running-state.js
-/diagnose.js
-/inspect-tabs.js
-/list-targets.js
-/read-transcript.js
-/read-transcript-html.js
-/probe-titles.js
-/probe-titles2.js
-/probe-titles3.js
-/probe-buttons.js
-/result.txt
-/scan-frames.js
-/send-prompt.js
-/verify-push.js
-
-# Ad-hoc dump files that accumulate here during debugging sessions
-*.txt
-*.json
-!package.json
-!package-lock.json
-!server/requirements.txt
-
-node_modules/
+# Everything at the repo root that is not source. Every real source file
+# lives under client/, server/ or tests/, so the root is only ever
+# throwaway: CDP spikes, probe scripts, captured DOM, dumped output. A
+# pattern rather than a list, because the list was always one debugging
+# session out of date.
+/*.js
+/*.txt
+/*.json
+/*.html
+/*.css
+!/package.json
+!/package-lock.json
