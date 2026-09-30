@@ -13,7 +13,12 @@
 //   CDP_PORT       default 9222
 //   POLL_INTERVAL_MS  default 1500 — cadence for subscribed sessions only;
 //                      unsubscribed sessions cost nothing between list calls
-//   DEPLOY_TARGET     optional, e.g. you@your-relay.example.com:/opt/claude-anywhere
+//   DEPLOY_TARGET     optional, and for development only. Unset — which is
+//                      how it ships — the daemon is purely a bridge and
+//                      writes nothing outside this machine. Set, every save
+//                      under server/ is rsynced to that host, which is a
+//                      push to production from an editor with no review
+//                      step. e.g. you@your-relay.example.com:/opt/claude-anywhere
 //                      — if set, also watches ../server and rsyncs it there
 //                      on change, so one `node --watch` loop deploys both
 //                      sides. Uses your own SSH key/agent, same as running
@@ -1810,7 +1815,18 @@ if (require.main === module) {
   const daemon = new Daemon();
   daemon.connect();
   watchConnection(daemon);
-  if (DEPLOY_TARGET) startDeployWatch();
+  // Said out loud, both ways. The deploy watcher is a development
+  // convenience — it rsyncs server/ to a live host on every save — and
+  // whether it is armed is not otherwise visible anywhere. Someone
+  // running this as a user should be able to see that nothing is being
+  // pushed; someone who copied a .env from somewhere should find out
+  // before the first save rather than after it.
+  if (DEPLOY_TARGET) {
+    console.error(`[deploy] ARMED: every save to server/ rsyncs to ${DEPLOY_TARGET}`);
+    startDeployWatch();
+  } else {
+    console.error('[deploy] off (DEPLOY_TARGET not set) — nothing will be pushed anywhere');
+  }
 }
 
 module.exports = {

@@ -11,6 +11,12 @@ user-facing fact — a command, a default, a limit — belongs in both, in the
 same commit. A translation that has drifted is worse than no translation,
 because nothing announces it.
 
+The Chinese one is written in Chinese rather than translated from the
+English, and uses full-width punctuation throughout its prose — `，`, `：`,
+`；` — including after a Latin word or a `**` that ends a Chinese clause.
+Half-width punctuation stays only inside code spans, fenced blocks, link
+targets and HTML attributes.
+
 ```
 VS Code webview ──CDP──► client/daemon.js ──WS──► server/server.py ──WS/HTTP──► phone
    (laptop)                  (laptop)                  (VPS)                  (browser)
@@ -100,8 +106,14 @@ changes" and sits there until someone edits a file.
   subscribe that cannot attach keeps its watcher and lets the poll loop
   retry, because deleting it meant the session never recovered. Attach
   failures report once per outage, not once per poll.
-- **The deploy watcher is optional and must not be able to take the bridge
-  down.** An `FSWatcher` with no `error` listener exits the process.
+- **The deploy watcher is optional, development-only, and must not be able
+  to take the bridge down.** It is armed solely by `DEPLOY_TARGET`, which
+  ships unset: a user running this never pushes anything anywhere, and the
+  daemon says which mode it is in at startup, because nothing else makes
+  that visible. When it is armed, every save under `server/` is a push to a
+  live host with no review step, so what it excludes is load-bearing — see
+  `DEPLOY_EXCLUDES`. An `FSWatcher` with no `error` listener exits the
+  process, which would cost the bridge to save the convenience.
 - Anything reached from an async event listener needs a `catch`. An
   unhandled rejection there is rethrown on the next tick and is fatal.
 
