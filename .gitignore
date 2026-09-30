@@ -2,6 +2,9 @@
 client/.env
 server/.env
 
+# macOS turds, anywhere in the tree
+.DS_Store
+
 # Runtime state, not source
 client/daemon.log
 server/data/

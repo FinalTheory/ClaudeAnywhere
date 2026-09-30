@@ -1,9 +1,15 @@
 # Agent guide — ClaudeAnywhere
 
 Mirrors and drives the Claude Code conversations already open in the
-author's desktop VS Code, from a phone. [`README.md`](README.md) is the
-user-facing half — what it is, what you need, how to run it. Everything
-below is for someone changing it.
+author's desktop VS Code, from a phone. [`README.md`](README.md) /
+[`README.zh-CN.md`](README.zh-CN.md) are the user-facing half — what it
+is, what you need, how to run it. Everything below is for someone
+changing it.
+
+**The two READMEs are one document in two languages.** A change to a
+user-facing fact — a command, a default, a limit — belongs in both, in the
+same commit. A translation that has drifted is worse than no translation,
+because nothing announces it.
 
 ```
 VS Code webview ──CDP──► client/daemon.js ──WS──► server/server.py ──WS/HTTP──► phone

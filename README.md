@@ -1,21 +1,20 @@
-# ClaudeAnywhere
+<p align="center">
+  <img src="assets/icon.png" alt="ClaudeAnywhere icon" width="96" />
+</p>
 
-Use the Claude Code conversation that is already open on your laptop — from
-your phone, from anywhere.
+<h1 align="center">ClaudeAnywhere</h1>
 
-Not a second session. Not a terminal in a browser. ClaudeAnywhere attaches to
-the Claude Code window running in your own VS Code and mirrors *that*
-conversation: the same history, the same context, the same running task. You
-read it on your phone and you type into it, and what you send arrives in the
-window you left open.
+<p align="center"><strong>Your laptop's Claude Code conversation, on your phone.</strong></p>
 
-Everything runs on machines you own — your laptop, and a small relay on your
-own VPS. No third-party service sits in the middle.
+<p align="center">
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">中文</a>
+</p>
 
-> Not affiliated with or endorsed by Anthropic. This is an independent
-> project and is not Claude Code's own Remote Control feature.
+Not a second session. Not a terminal in a browser. ClaudeAnywhere attaches to the Claude Code window running in your own VS Code and mirrors *that* conversation: the same history, the same context, the same running task. You read it on your phone and you type into it, and what you send arrives in the window you left open.
 
----
+Everything runs on machines you own — your laptop, and a small relay on your own VPS. No third-party service sits in the middle.
+
+> Not affiliated with or endorsed by Anthropic. This is an independent project and is not Claude Code's own Remote Control feature.
 
 ## Why you might want this
 
