@@ -193,6 +193,7 @@ test('_tick: a running-state flip is reported once, not on every poll', async (t
   );
 });
 
+
 // --- arraysEqual ----------------------------------------------------------
 
 test('arraysEqual: length, order and content all matter', () => {
@@ -216,6 +217,59 @@ test('stripTags: removes markup and collapses whitespace', () => {
 // quote/newline/backslash that isn't escaped is either a syntax error or,
 // worse, silently different text typed into someone's editor.
 
+// A document shaped like Claude Code's: the send button and the composer
+// inside one container, and — when `overlay` is set — a second text box
+// appended after them, which is what an open picker looks like. The three
+// expressions that have to find the composer all used "the last box in the
+// document", and a fake with one undifferentiated querySelectorAll could
+// not tell that rule apart from the right one.
+function fakeComposerDoc({ overlay = false, sendButton = true, boxValue, box } = {}) {
+  const log = { focused: [], inserted: [], commands: [] };
+  const mk = (name, extra) => {
+    const el = Object.assign(
+      {
+        name,
+        innerText: '',
+        getAttribute: () => null,
+        focus() { log.focused.push(name); },
+        querySelector: () => null,
+      },
+      extra || {}
+    );
+    el.contains = (o) => o === el;
+    return el;
+  };
+
+  const composer = mk(
+    'composer',
+    Object.assign({}, boxValue === undefined ? {} : { value: boxValue }, box || {})
+  );
+  const send = mk('send', { getAttribute: (n) => (n === 'aria-label' ? 'Send message' : null) });
+  const container = mk('container');
+  container.querySelector = () => composer;
+  container.contains = (o) => o === composer || o === send || o === container;
+  send.parentElement = container;
+  container.parentElement = null;
+
+  const boxes = [composer];
+  if (overlay) boxes.push(mk('overlay-input'));
+
+  const doc = {
+    querySelectorAll(sel) {
+      if (sel.indexOf('button') !== -1) return sendButton ? [send] : [];
+      if (sel.indexOf('commandItem_') !== -1) return [];
+      return boxes;
+    },
+    execCommand(cmd, ui, value) {
+      log.commands.push(cmd);
+      if (cmd === 'insertText') log.inserted.push(value);
+      if (cmd === 'delete' && composer.value !== undefined) composer.value = '';
+      return true;
+    },
+  };
+  return { doc, log, composer };
+}
+
 function runInject(text, doc) {
   // eslint-disable-next-line no-new-func
   return new Function('document', `return (${injectExpr(text)});`)(doc);
@@ -232,14 +286,10 @@ test('injectExpr: round-trips text through JS source exactly', () => {
     '中文 with unicode 😀',
     '</script><script>alert(1)</script>',
   ]) {
-    const inserted = [];
-    const doc = {
-      querySelectorAll: () => [{ focus() {} }],
-      execCommand: (_cmd, _ui, value) => inserted.push(value),
-    };
+    const { doc, log } = fakeComposerDoc();
     const result = runInject(text, doc);
-    assert.deepStrictEqual(result, { ok: true }, `ok for: ${JSON.stringify(text)}`);
-    assert.deepStrictEqual(inserted, [text], `exact text for: ${JSON.stringify(text)}`);
+    assert.strictEqual(result.ok, true, `ok for: ${JSON.stringify(text)}`);
+    assert.deepStrictEqual(log.inserted, [text], `exact text for: ${JSON.stringify(text)}`);
   }
 });
 
@@ -249,17 +299,36 @@ test('injectExpr: reports failure when no input element is found', () => {
   assert.match(out.reason, /no input candidates/);
 });
 
-test('injectExpr: targets the last candidate, where a chat input sits', () => {
-  const focused = [];
-  const doc = {
-    querySelectorAll: () => [
-      { focus: () => focused.push('first') },
-      { focus: () => focused.push('last') },
-    ],
-    execCommand: () => {},
-  };
-  runInject('hi', doc);
-  assert.deepStrictEqual(focused, ['last']);
+test('injectExpr: types into the composer the send button belongs to', () => {
+  // Not "the last box in the document", which is what three separate
+  // expressions each implemented on their own. Any second text box
+  // anywhere in the page — a search field, a rename box, an overlay —
+  // takes the message instead, and execCommand still answers true, so it
+  // is reported sent. The send button's aria-label is the one verified
+  // handle here, and the composer sits inside the same container.
+  //
+  // This is not what caused the picker deadlock: a picker makes the real
+  // composer refuse input rather than adding a box of its own. It is kept
+  // because one rule anchored on something semantic beats three copies of
+  // a rule anchored on document order.
+  const { doc, log } = fakeComposerDoc({ overlay: true });
+  const out = runInject('hi', doc);
+  assert.strictEqual(out.ok, true);
+  assert.deepStrictEqual(log.focused, ['composer'], 'not the overlay');
+  assert.deepStrictEqual(log.inserted, ['hi']);
+  assert.strictEqual(out.how, 'send-button');
+  assert.strictEqual(out.boxes, 2, 'and it reports that something else is on screen');
+});
+
+test('injectExpr: an unambiguous single box still works without a send button', () => {
+  // The fallback is only dangerous when it has to choose. One box is one
+  // box, and refusing there would break the ordinary case to guard a
+  // situation that is not happening.
+  const { doc, log } = fakeComposerDoc({ sendButton: false });
+  const out = runInject('hi', doc);
+  assert.strictEqual(out.ok, true);
+  assert.strictEqual(out.how, 'last-in-document');
+  assert.deepStrictEqual(log.inserted, ['hi']);
 });
 
 // --- dispatchEnter --------------------------------------------------------
@@ -1356,19 +1425,16 @@ test('CLEAR_COMPOSER_EXPR: judges the composer, not execCommand\'s answer', () =
   // Trusting the return value made every MCP action fail with
   // "selectAll refused" on a flow that had been working, so what is left
   // in the composer is the only thing consulted.
-  const cleared = { value: 'draft', focus() {}, innerHTML: 'draft' };
-  const lying = {
-    querySelectorAll: () => [cleared],
-    execCommand: (cmd) => {
-      if (cmd === 'delete') cleared.value = '';
-      return false; // refuses on paper, works in fact
-    },
+  const lying = fakeComposerDoc({ boxValue: 'draft' });
+  lying.doc.execCommand = (cmd) => {
+    if (cmd === 'delete') lying.composer.value = '';
+    return false; // refuses on paper, works in fact
   };
-  assert.strictEqual(runExpr(CLEAR_COMPOSER_EXPR, lying).ok, true);
+  assert.strictEqual(runExpr(CLEAR_COMPOSER_EXPR, lying.doc).ok, true);
 
-  const stuck = { value: 'still here', focus() {}, innerHTML: '' };
-  const useless = { querySelectorAll: () => [stuck], execCommand: () => true };
-  const out = runExpr(CLEAR_COMPOSER_EXPR, useless);
+  const stuck = fakeComposerDoc({ boxValue: 'still here' });
+  stuck.doc.execCommand = () => true; // claims success, changes nothing
+  const out = runExpr(CLEAR_COMPOSER_EXPR, stuck.doc);
   assert.strictEqual(out.ok, false, 'text left behind is the failure, whatever was returned');
   assert.match(out.reason, /still holds text/);
 });
@@ -1382,12 +1448,9 @@ test('MENU_STATE_EXPR: only a draft with a line break is unrestorable', () => {
   // innerText is what makes the real distinction visible: it renders
   // <p>a</p><p>b</p> with a line break between them, where textContent
   // would have flattened it to "ab" and hidden the problem.
-  const editor = (innerText, innerHTML) => ({
-    querySelectorAll: (sel) => (sel.includes('commandItem_') ? [] : [{ innerText, innerHTML }]),
-  });
-  const textarea = (value) => ({
-    querySelectorAll: (sel) => (sel.includes('commandItem_') ? [] : [{ value }]),
-  });
+  const editor = (innerText, innerHTML) =>
+    fakeComposerDoc({ box: { innerText, innerHTML } }).doc;
+  const textarea = (value) => fakeComposerDoc({ box: { value } }).doc;
 
   const oneLine = runExpr(MENU_STATE_EXPR, editor('hello', '<p>hello</p>'));
   assert.strictEqual(oneLine.draft, 'hello');

@@ -118,9 +118,23 @@ polling entirely.
 - **One laptop, one user.** A second daemon connecting replaces the first.
 - **A conversation is identified by its VS Code tab.** Close and reopen the
   tab, or restart VS Code, and it counts as a new one.
-- **The phone cannot answer interactive prompts** that Claude Code renders as
-  its own picker — you will see the question, but choosing still happens at
-  the laptop.
+- **The phone cannot answer Claude Code's own pickers, so tell Claude not
+  to use them.** While a picker is open the composer on the laptop goes
+  inert: a message sent from the phone is refused — loudly, saying a picker
+  is probably waiting — and the picker itself is not reachable from the
+  phone. The send button reads "Stop" throughout, so it looks exactly like
+  a long task. One picker opened while you are away locks the conversation
+  until you are back at the laptop.
+
+  Worth a standing instruction in your own `CLAUDE.md` or `AGENTS.md`, so
+  it never comes up:
+
+  > Never ask with a picker — no `AskUserQuestion`, no options rendered as
+  > a chooser. Put the question and the choices in an ordinary message and
+  > wait for a text answer.
+
+  Everything a picker does is available by writing the question out, which
+  is why this is the fix rather than something to engineer around.
 
 ## Contributing
 

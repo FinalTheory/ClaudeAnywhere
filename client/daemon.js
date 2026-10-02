@@ -189,22 +189,89 @@ const POLL_EXPR = `
 })()
 `;
 
+// The prompt composer, found by the control that submits it rather than by
+// document order.
+//
+// "The last textbox in the document" was the rule in three separate
+// places, each implementing it independently. Any second text box in the
+// page takes the message instead — a search field, a rename box, an
+// overlay — and execCommand still answers true, so it is reported sent.
+//
+// This did not cause the picker deadlock. Measured against a live picker,
+// the composer is found correctly and the editor refuses the insert: a
+// picker makes the real composer inert rather than adding a box of its
+// own. The rule is anchored on something semantic anyway, because one
+// definition beats three copies keyed on document order.
+//
+// The send button is the one verified handle in this markup: its
+// aria-label is "Send message" or "Stop" and nothing else uses those. The
+// composer is inside the same container, so walk up from the button.
+// Spliced into every expression that needs it, because three independent
+// copies of one rule is how they came to disagree.
+const FIND_COMPOSER_JS = `
+  const BOX_SEL = 'textarea, [contenteditable="true"], [role="textbox"]';
+  function findComposer() {
+    const boxes = [...document.querySelectorAll(BOX_SEL)];
+    const send = [...document.querySelectorAll('button, [role="button"]')].find((el) => {
+      const n = (el.getAttribute('aria-label') || '').trim();
+      return n === 'Send message' || n === 'Stop';
+    });
+    if (send) {
+      let node = send.parentElement;
+      let hops = 0;
+      while (node && hops < 8) {
+        const box = node.querySelector(BOX_SEL);
+        // Containment re-asserted rather than inferred from the walk
+        // having stopped: the loop also exits on the hop cap.
+        if (box && node.contains(box)) {
+          return { el: box, how: 'send-button', boxes: boxes.length };
+        }
+        node = node.parentElement;
+        hops += 1;
+      }
+    }
+    return {
+      el: boxes.length ? boxes[boxes.length - 1] : null,
+      how: 'last-in-document',
+      boxes: boxes.length,
+    };
+  }
+`;
+
 function injectExpr(text) {
   return `
 (function(text) {
-  const candidates = document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]');
-  if (candidates.length === 0) return { ok: false, reason: 'no input candidates found' };
-  const el = candidates[candidates.length - 1];
-  el.focus();
+${FIND_COMPOSER_JS}
+  const found = findComposer();
+  if (!found.el) return { ok: false, reason: 'no input candidates found' };
+  found.el.focus();
   // execCommand returns false when the command is unsupported or refused.
   // Discarding that made submit() answer ok for text that never landed,
   // so the phone cleared the composer and reported success. It is
   // deprecated, and CDP's Input.insertText is the durable replacement —
   // untried here because it cannot be verified without a live target.
   if (!document.execCommand('insertText', false, text)) {
-    return { ok: false, reason: 'execCommand(insertText) was refused by the editor' };
+    // Observed, then interpreted. The composer was located and the editor
+    // itself would not take the text, which is what a session blocked on
+    // one of Claude Code's own pickers does: the composer goes inert until
+    // the question is answered. The box count and how it was located
+    // travel with it, because they are what distinguish that from a markup
+    // change. Saying only "refused by the editor" is true and tells the
+    // author nothing they can act on.
+    //
+    // No backticks in this comment: it sits inside a template literal, so
+    // one would end the string here. Same family as the backslash trap
+    // documented in AGENTS.md.
+    return {
+      ok: false,
+      reason: 'the laptop would not accept the text — Claude Code is most likely ' +
+        'waiting on a picker there, which has to be answered on the laptop',
+      refused: true,
+      boxes: found.boxes,
+      how: found.how,
+    };
   }
-  return { ok: true };
+  return { ok: true, boxes: found.boxes, how: found.how };
 })(${JSON.stringify(text)})
 `;
 }
@@ -734,12 +801,14 @@ async function waitFor(run, probe, done, { timeoutMs = 8000, everyMs = 250 } = {
 // too many.
 const MENU_STATE_EXPR = `
 (function () {
+${FIND_COMPOSER_JS}
   const items = [...document.querySelectorAll('[class*="commandItem_"]')].map((el) => {
     const lab = el.querySelector('[class*="commandLabel_"]');
     return ((lab || el).textContent || '').trim();
   });
-  const box = [...document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')].pop();
-  if (!box) return { items, draft: null, structured: false };
+  const found = findComposer();
+  const box = found.el;
+  if (!box) return { items, draft: null, structured: false, boxes: found.boxes };
   // innerText, not textContent. textContent flattens a rich editor —
   // <p>a</p><p>b</p> reads as "ab" — so restoring that as plain text
   // would silently join two paragraphs. innerText renders the same DOM
@@ -760,7 +829,7 @@ const MENU_STATE_EXPR = `
   const LF = String.fromCharCode(10);
   const CR = String.fromCharCode(13);
   const structured = draft.indexOf(LF) >= 0 || draft.indexOf(CR) >= 0;
-  return { items, draft, structured };
+  return { items, draft, structured, boxes: found.boxes, how: found.how };
 })()
 `;
 
@@ -791,7 +860,9 @@ const CLICK_MCP_COMMAND_EXPR = `
 // than it sounds: the author may have been mid-sentence on the laptop.
 const CLEAR_COMPOSER_EXPR = `
 (function () {
-  const box = [...document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')].pop();
+${FIND_COMPOSER_JS}
+  const found = findComposer();
+  const box = found.el;
   if (!box) return { ok: false, reason: 'no composer' };
   box.focus();
   // execCommand's return value is not evidence here: this editor answers

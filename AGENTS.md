@@ -434,7 +434,7 @@ session that is not currently subscribed.
 
 ## Conventions
 
-- Commits follow `eviworkspace`'s: `<type>(<scope>): [skip jira] <subject>`.
+- Commits follow conventional commits: `<type>(<scope>): <subject>`.
   Bodies carry what the diff cannot — the rejected alternative, the non-obvious
   constraint, what verified it.
 - Comments explain *why*, especially where a line looks arbitrary. Most of the
